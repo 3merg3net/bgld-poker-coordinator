@@ -6,6 +6,7 @@ import { PokerRoomManager } from "./rooms/PokerRoomManager";
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
 
+// Keep one instance per room
 const rooms = new Map<string, PokerRoomManager>();
 
 function getRoom(roomId: string): PokerRoomManager {
@@ -22,58 +23,53 @@ const wss = new WebSocketServer({ port: PORT });
 console.log(`[Coordinator] WebSocket server listening on :${PORT}`);
 
 wss.on("connection", (socket: WebSocket) => {
-  console.log("🔌 [Coordinator] New WS client connected");
+  console.log("[Coordinator] New WebSocket client connected");
 
   let currentRoomId: string | null = null;
   let currentPlayerId: string | null = null;
 
-  socket.on("message", (data: WebSocket.RawData) => {
+  socket.on("message", (rawData: WebSocket.RawData) => {
     try {
-      const raw = data.toString();
-      const msg = JSON.parse(raw) as ClientToServerMessage;
+      const msg = JSON.parse(rawData.toString()) as ClientToServerMessage;
 
-      console.log("📥 [Coordinator] Incoming message:", msg);
-
+      // Ignore non-poker messages
       if (msg.kind !== "poker") return;
 
       const room = getRoom(msg.roomId);
 
       // First message MUST be join-room
       if (!currentRoomId || !currentPlayerId) {
-        if (msg.type === "join-room") {
-          currentRoomId = msg.roomId;
-          currentPlayerId = msg.playerId;
-          console.log(
-            `🪑 [Coordinator] Player joined room: ${currentPlayerId} → ${currentRoomId}`
-          );
-          room.addClient(currentPlayerId, socket, (msg as any).name);
-        } else {
-          console.warn(
-            "[Coordinator] First message must be join-room. Got:",
-            msg.type
-          );
+        if (msg.type !== "join-room") {
+          console.warn("[Coordinator] First message must be join-room.");
           return;
         }
+
+        currentRoomId = msg.roomId;
+        currentPlayerId = msg.playerId;
+
+        // Register client with the room manager
+        room.addClient(currentPlayerId, socket, (msg as any).name);
+
+        // Room manager is responsible for sending any initial state
+        return;
       }
 
-      // Forward all in-room actions
+      // Forward subsequent messages to the room manager
       room.handleMessage(msg);
     } catch (err) {
-      console.error("[Coordinator] ERROR parsing/handling message:", err);
+      console.error("[Coordinator] Failed to process message:", err);
     }
   });
 
   socket.on("close", () => {
-    console.log("🔌 [Coordinator] Client disconnected");
+    console.log("[Coordinator] Client disconnected");
     if (currentRoomId && currentPlayerId) {
       const room = rooms.get(currentRoomId);
-      if (room) {
-        room.removeClient(currentPlayerId);
-      }
+      room?.removeClient(currentPlayerId);
     }
   });
 
   socket.on("error", (err) => {
-    console.error("[Coordinator] WS Socket Error:", err);
+    console.error("[Coordinator] Socket error:", err);
   });
 });

@@ -16,6 +16,12 @@ export class PokerRoomManager {
   private seats: SeatView[] = [];
   private game: HoldemGame = new HoldemGame();
 
+  // ✅ New: track if a hand is currently running
+  private handInProgress = false;
+
+  // ✅ New: track total fake rake (5% of pot) over this server lifetime
+  private totalFakeRake = 0;
+
   constructor(roomId: string) {
     this.roomId = roomId;
 
@@ -163,12 +169,27 @@ export class PokerRoomManager {
     }
   }
 
+  // ───────────────── SITTING / STANDING ─────────────────
+
   private handleSit(
     playerId: string,
     buyIn?: number,
     seatIndex?: number,
     name?: string
   ) {
+    // If a hand is running, don't let new players pop in mid-hand
+    if (this.handInProgress) {
+      this.sendTo(playerId, {
+        kind: "poker",
+        roomId: this.roomId,
+        playerId,
+        type: "error",
+        message:
+          "A hand is currently in progress. Please wait for this hand to finish before sitting.",
+      });
+      return;
+    }
+
     // If already seated, ignore
     const already = this.seats.find((s) => s.playerId === playerId);
     if (already) return;
@@ -195,7 +216,7 @@ export class PokerRoomManager {
       return;
     }
 
-    // SANITIZE BUY-IN
+    // SANITIZE BUY-IN (fake chips)
     const stack = Math.max(1, Math.floor(buyIn ?? 0));
 
     // Assign seat
@@ -241,7 +262,36 @@ export class PokerRoomManager {
     }
   }
 
+  // ───────────────── HAND LIFECYCLE ─────────────────
+
   private handleStartHand(requesterId: string) {
+    // Prevent spamming new hands while one is running
+    if (this.handInProgress) {
+      this.sendTo(requesterId, {
+        kind: "poker",
+        roomId: this.roomId,
+        playerId: requesterId,
+        type: "error",
+        message: "A hand is already in progress.",
+      });
+      return;
+    }
+
+    // Require at least 2 active players with chips
+    const activeSeats = this.seats.filter(
+      (s) => s.playerId && (s.chips ?? 0) > 0
+    );
+    if (activeSeats.length < 2) {
+      this.sendTo(requesterId, {
+        kind: "poker",
+        roomId: this.roomId,
+        playerId: requesterId,
+        type: "error",
+        message: "At least 2 seated players with chips are required to start a hand.",
+      });
+      return;
+    }
+
     const table = this.game.startHand(this.seats);
 
     if (!table) {
@@ -254,6 +304,9 @@ export class PokerRoomManager {
       });
       return;
     }
+
+    // Mark a hand as running
+    this.handInProgress = true;
 
     // Broadcast table + betting
     this.broadcast({
@@ -325,8 +378,17 @@ export class PokerRoomManager {
       });
     }
 
-    // If hand ended, compute and broadcast showdown
+    // If hand ended, compute and broadcast showdown + track fake rake
     if (betting.street === "done") {
+      // 👉 Fake rake: 5% of final pot
+      const fakeRake = Math.floor((betting.pot * 5) / 100);
+      this.totalFakeRake += fakeRake;
+
+      console.log(
+        `[PokerRoom:${this.roomId}] Hand #${betting.handId} complete. Pot=${betting.pot}, ` +
+          `Fake rake (5%)=${fakeRake}, Total fake rake=${this.totalFakeRake}`
+      );
+
       const showdown = this.game.computeShowdown();
       if (showdown) {
         this.broadcast({
@@ -336,12 +398,16 @@ export class PokerRoomManager {
           type: "showdown",
           handId: showdown.handId,
           board: showdown.board,
-          // showdown.players already has correct card types
           players: showdown.players as any,
         });
       }
+
+      // Hand is over; allow new players to sit and new hand to start
+      this.handInProgress = false;
     }
   }
+
+  // ───────────────── LOW-LEVEL SEND HELPERS ─────────────────
 
   private broadcast(message: ServerToClientMessage) {
     const raw = JSON.stringify(message);
