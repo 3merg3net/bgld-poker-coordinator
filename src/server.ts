@@ -6,6 +6,11 @@ import { PokerRoomManager } from "./rooms/PokerRoomManager";
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
 
+// Extend ws type to track heartbeat state
+type ExtWebSocket = WebSocket & {
+  isAlive?: boolean;
+};
+
 // Keep one instance per room
 const rooms = new Map<string, PokerRoomManager>();
 
@@ -22,8 +27,48 @@ const wss = new WebSocketServer({ port: PORT });
 
 console.log(`[Coordinator] WebSocket server listening on :${PORT}`);
 
-wss.on("connection", (socket: WebSocket) => {
+// ───────────────── HEARTBEAT / KEEPALIVE ─────────────────
+
+const HEARTBEAT_INTERVAL_MS = 30_000; // 30s ping to keep Railway/proxy happy
+
+const heartbeatInterval = setInterval(() => {
+  wss.clients.forEach((client) => {
+    const socket = client as ExtWebSocket;
+
+    // If it was already marked dead, terminate it
+    if (socket.isAlive === false) {
+      console.log("[Coordinator] Terminating stale client");
+      return socket.terminate();
+    }
+
+    // Mark it as not alive; if we get a pong, we'll flip back to true
+    socket.isAlive = false;
+
+    try {
+      socket.ping();
+    } catch (err) {
+      console.error("[Coordinator] Ping error, terminating client:", err);
+      socket.terminate();
+    }
+  });
+}, HEARTBEAT_INTERVAL_MS);
+
+wss.on("close", () => {
+  clearInterval(heartbeatInterval);
+});
+
+// ───────────────── CONNECTION HANDLER ─────────────────
+
+wss.on("connection", (socketRaw: WebSocket) => {
+  const socket = socketRaw as ExtWebSocket;
+
   console.log("[Coordinator] New WebSocket client connected");
+
+  // Init heartbeat state
+  socket.isAlive = true;
+  socket.on("pong", () => {
+    socket.isAlive = true;
+  });
 
   let currentRoomId: string | null = null;
   let currentPlayerId: string | null = null;
@@ -54,7 +99,7 @@ wss.on("connection", (socket: WebSocket) => {
         return;
       }
 
-      // Forward subsequent messages to the room manager
+      // Forward subsequent messages to the room manager (same signature as before)
       room.handleMessage(msg);
     } catch (err) {
       console.error("[Coordinator] Failed to process message:", err);
