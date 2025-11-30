@@ -27,11 +27,11 @@ export type BettingStreet = "preflop" | "flop" | "turn" | "river" | "done";
 export type BettingPlayerState = {
   seatIndex: number;
   playerId: string;
-  stack: number;
+  stack: number;        // current in-hand stack
   inHand: boolean;
   hasFolded: boolean;
   hasActed: boolean;
-  committed: number;
+  committed: number;    // amount committed this street
 };
 
 export type BettingState = {
@@ -66,7 +66,9 @@ export type ShowdownState = {
 // Helper: Deck + cards
 // -------------------
 
-const RANKS = ["2","3","4","5","6","7","8","9","T","J","Q","K","A"] as const;
+const RANKS = [
+  "2","3","4","5","6","7","8","9","T","J","Q","K","A"
+] as const;
 const SUITS = ["s","h","d","c"] as const;
 
 type Card = string; // e.g. "As", "Td"
@@ -121,16 +123,26 @@ export class HoldemGame {
     return this.betting;
   }
 
+  /**
+   * Used by the room manager to sync seat.chips with the
+   * in-hand stacks the game engine is tracking.
+   */
+  getSeatStacksForCurrentHand(): { seatIndex: number; stack: number }[] {
+    if (!this.betting) return [];
+    return this.betting.players.map((p) => ({
+      seatIndex: p.seatIndex,
+      stack: p.stack,
+    }));
+  }
+
   // Called by server when a new hand should start
   startHand(seats: SeatView[]): TableState | null {
-  // For demo: anyone with a playerId is eligible.
-  // We ignore chip counts here and only require at least 1 seated player.
-  const activeSeats = seats.filter((s) => !!s.playerId);
+    // Eligible = any seat with a playerId
+    const activeSeats = seats.filter((s) => !!s.playerId);
 
-  // Only bail if literally nobody is seated.
-  if (activeSeats.length < 1) {
-    return null;
-  }
+    if (activeSeats.length < 1) {
+      return null;
+    }
 
     // Snapshot seats for this hand
     this.seatsSnapshot = seats.map((s) => ({ ...s }));
@@ -147,7 +159,8 @@ export class HoldemGame {
         .map((s) => s.seatIndex)
         .sort((a, b) => a - b);
       const currentIdx = occupied.indexOf(this.buttonSeatIndex);
-      const nextIdx = currentIdx === -1 ? 0 : (currentIdx + 1) % occupied.length;
+      const nextIdx =
+        currentIdx === -1 ? 0 : (currentIdx + 1) % occupied.length;
       this.buttonSeatIndex = occupied[nextIdx];
     }
 
@@ -208,7 +221,8 @@ export class HoldemGame {
     if (positions.length === 2) {
       // Heads-up: button = small blind; other = big blind
       smallBlindSeat = this.buttonSeatIndex;
-      bigBlindSeat = positions.find((s) => s !== this.buttonSeatIndex) ?? null;
+      bigBlindSeat =
+        positions.find((s) => s !== this.buttonSeatIndex) ?? null;
     } else {
       // 3+ players
       const idxBtn = positions.indexOf(this.buttonSeatIndex!);
@@ -226,28 +240,26 @@ export class HoldemGame {
       players: BettingPlayerState[],
       seatIndex: number | null,
       amount: number
-    ) {
-      if (seatIndex == null) return { pot: 0, maxCommitted: 0 };
+    ): { potDelta: number; committed: number } {
+      if (seatIndex == null) return { potDelta: 0, committed: 0 };
       const p = players.find((x) => x.seatIndex === seatIndex);
-      if (!p) return { pot: 0, maxCommitted: 0 };
+      if (!p) return { potDelta: 0, committed: 0 };
       const blind = Math.min(amount, p.stack);
       p.stack -= blind;
       p.committed += blind;
       p.hasActed = false; // blinds can still act on preflop
-      return { pot: blind, committed: p.committed };
+      return { potDelta: blind, committed: p.committed };
     }
 
     if (smallBlindSeat != null) {
       const res = applyBlind(bettingPlayers, smallBlindSeat, smallBlind);
-      pot += res.pot;
-     Math.max(maxCommitted, res.committed ?? 0)
-
+      pot += res.potDelta;
+      maxCommitted = Math.max(maxCommitted, res.committed ?? 0);
     }
     if (bigBlindSeat != null) {
       const res = applyBlind(bettingPlayers, bigBlindSeat, bigBlind);
-      pot += res.pot;
-      Math.max(maxCommitted, res.committed ?? 0)
-
+      pot += res.potDelta;
+      maxCommitted = Math.max(maxCommitted, res.committed ?? 0);
     }
 
     // First to act preflop = first seat after big blind
@@ -372,7 +384,8 @@ export class HoldemGame {
 
     for (const bp of active) {
       const tp = t.players.find(
-        (pl) => pl.playerId === bp.playerId && pl.seatIndex === bp.seatIndex
+        (pl) =>
+          pl.playerId === bp.playerId && pl.seatIndex === bp.seatIndex
       );
       if (!tp) continue;
 
@@ -380,7 +393,7 @@ export class HoldemGame {
       const seven = [...hole, ...board];
 
       const ev = this.evaluateSevenCards(seven);
-      evals.push({ bp, eval: ev });
+      evals.push({ bp: bp, eval: ev });
     }
 
     if (evals.length === 0) return null;
@@ -395,6 +408,22 @@ export class HoldemGame {
 
     const winners = evals.filter((e) => e.eval.score === bestScore);
 
+    // ── VERY SIMPLE POT AWARD (NO TRUE SIDE-POT LOGIC YET) ──
+    if (winners.length > 0 && b.pot > 0) {
+      const share = Math.floor(b.pot / winners.length);
+      const remainder = b.pot - share * winners.length;
+
+      winners.forEach((w, idx) => {
+        // bp references objects inside b.players
+        w.bp.stack += share + (idx === 0 ? remainder : 0);
+      });
+
+      // Pot fully distributed
+      b.pot = 0;
+      this.betting = b;
+    }
+
+    // Build showdown payload for clients
     const showdownPlayers: ShowdownPlayerState[] = [];
 
     for (const { bp, eval: ev } of evals) {
@@ -411,8 +440,6 @@ export class HoldemGame {
         isWinner: winners.some((w) => w.bp.playerId === bp.playerId),
       });
     }
-
-    // (Optional) simple rake + payouts can be wired here later
 
     this.showdown = {
       handId: t.handId,
@@ -519,7 +546,11 @@ export class HoldemGame {
       }
 
       // Choose first active player as new currentSeatIndex
-      const nextSeat = this.findNextSeatToAct(b.players, b.buttonSeatIndex, true);
+      const nextSeat = this.findNextSeatToAct(
+        b.players,
+        b.buttonSeatIndex,
+        true
+      );
       b.currentSeatIndex = nextSeat;
       this.betting = b;
       this.lastTable = t;

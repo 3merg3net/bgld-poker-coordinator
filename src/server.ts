@@ -47,13 +47,12 @@ wss.on("connection", (socket: WebSocket) => {
           console.error("[Coordinator] Failed to send heartbeat:", err);
         }
       } else {
-        // Socket closed / closing, stop the interval
         if (heartbeatTimer) {
           clearInterval(heartbeatTimer);
           heartbeatTimer = null;
         }
       }
-    }, 25000); // ~25s is a nice “safe” under most idle timeouts
+    }, 25000);
   };
 
   startHeartbeat();

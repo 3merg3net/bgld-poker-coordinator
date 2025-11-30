@@ -16,10 +16,10 @@ export class PokerRoomManager {
   private seats: SeatView[] = [];
   private game: HoldemGame = new HoldemGame();
 
-  // ✅ New: track if a hand is currently running
+  // Track if a hand is currently running (for sit/stand + start-hand safety)
   private handInProgress = false;
 
-  // ✅ New: track total fake rake (5% of pot) over this server lifetime
+  // Fake rake tracker (just console logging; not applied to stacks)
   private totalFakeRake = 0;
 
   constructor(roomId: string) {
@@ -287,7 +287,8 @@ export class PokerRoomManager {
         roomId: this.roomId,
         playerId: requesterId,
         type: "error",
-        message: "At least 2 seated players with chips are required to start a hand.",
+        message:
+          "At least 2 seated players with chips are required to start a hand.",
       });
       return;
     }
@@ -337,6 +338,9 @@ export class PokerRoomManager {
         players: betting.players,
       });
     }
+
+    // Ensure seats reflect in-hand stacks (usually identical at start)
+    this.syncSeatStacksFromGame();
   }
 
   private handleAction(
@@ -346,6 +350,9 @@ export class PokerRoomManager {
   ) {
     const betting = this.game.applyAction(playerId, action, amount);
     if (!betting) return;
+
+    // After server updates, keep the seat.chips in sync with betting stacks
+    this.syncSeatStacksFromGame();
 
     // Always broadcast updated betting state
     this.broadcast({
@@ -378,15 +385,16 @@ export class PokerRoomManager {
       });
     }
 
-    // If hand ended, compute and broadcast showdown + track fake rake
+    // If hand ended, compute and broadcast showdown
     if (betting.street === "done") {
-      // 👉 Fake rake: 5% of final pot
+      // 👉 Fake rake: 5% of final pot (for logging only; pot already
+      // distributed by HoldemGame.computeShowdown)
       const fakeRake = Math.floor((betting.pot * 5) / 100);
       this.totalFakeRake += fakeRake;
 
       console.log(
-        `[PokerRoom:${this.roomId}] Hand #${betting.handId} complete. Pot=${betting.pot}, ` +
-          `Fake rake (5%)=${fakeRake}, Total fake rake=${this.totalFakeRake}`
+        `[PokerRoom:${this.roomId}] Hand #${betting.handId} complete. ` +
+          `Pot=${betting.pot}, Fake rake (5%)=${fakeRake}, Total fake rake=${this.totalFakeRake}`
       );
 
       const showdown = this.game.computeShowdown();
@@ -402,8 +410,48 @@ export class PokerRoomManager {
         });
       }
 
+      // After showdown, seat stacks are final for this hand
+      this.syncSeatStacksFromGame();
+
       // Hand is over; allow new players to sit and new hand to start
       this.handInProgress = false;
+    }
+  }
+
+  // ───────────────── STACK SYNC HELPER ─────────────────
+
+  /**
+   * Pulls current in-hand stacks from HoldemGame and
+   * mirrors them onto this.seats[].chips so the UI
+   * shows accurate chip stacks at each avatar.
+   */
+  private syncSeatStacksFromGame() {
+    const seatStacks = this.game.getSeatStacksForCurrentHand();
+    if (!seatStacks.length) return;
+
+    let changed = false;
+
+    this.seats = this.seats.map((s) => {
+      if (!s.playerId) return s;
+      const match = seatStacks.find(
+        (ss) => ss.seatIndex === s.seatIndex
+      );
+      if (!match) return s;
+      if (s.chips !== match.stack) {
+        changed = true;
+        return { ...s, chips: match.stack };
+      }
+      return s;
+    });
+
+    if (changed) {
+      this.broadcast({
+        kind: "poker",
+        roomId: this.roomId,
+        playerId: "server",
+        type: "seats-update",
+        seats: this.seats,
+      });
     }
   }
 
