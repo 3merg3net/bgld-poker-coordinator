@@ -16,10 +16,10 @@ export class PokerRoomManager {
   private seats: SeatView[] = [];
   private game: HoldemGame = new HoldemGame();
 
-  // Track if a hand is currently running (for sit/stand + start-hand safety)
+  // Track if a hand is currently running
   private handInProgress = false;
 
-  // Fake rake tracker (just console logging; not applied to stacks)
+  // Track lifetime fake rake (just for logging / dev)
   private totalFakeRake = 0;
 
   constructor(roomId: string) {
@@ -42,6 +42,9 @@ export class PokerRoomManager {
       playerId,
       name,
     });
+
+    // Clear out any seats that belong to players who are no longer connected
+    this.cleanupGhostSeats();
 
     this.broadcast({
       kind: "poker",
@@ -123,6 +126,11 @@ export class PokerRoomManager {
       playerId,
       type: "room-left",
     });
+
+    // If no clients remain, hard reset table so no ghost seats/hands remain
+    if (this.clients.size === 0) {
+      this.resetTableState();
+    }
   }
 
   handleMessage(msg: ClientToServerMessage) {
@@ -265,7 +273,13 @@ export class PokerRoomManager {
   // ───────────────── HAND LIFECYCLE ─────────────────
 
   private handleStartHand(requesterId: string) {
-    // Prevent spamming new hands while one is running
+    // Re-sync handInProgress with actual betting state
+    const currentBetting = this.game.getBettingState();
+    if (!currentBetting || currentBetting.street === "done") {
+      this.handInProgress = false;
+    }
+
+    // Prevent spamming new hands while one is really running
     if (this.handInProgress) {
       this.sendTo(requesterId, {
         kind: "poker",
@@ -276,6 +290,9 @@ export class PokerRoomManager {
       });
       return;
     }
+
+    // Clear any ghost seats before we look at active players
+    this.cleanupGhostSeats();
 
     // Require at least 2 active players with chips
     const activeSeats = this.seats.filter(
@@ -338,9 +355,6 @@ export class PokerRoomManager {
         players: betting.players,
       });
     }
-
-    // Ensure seats reflect in-hand stacks (usually identical at start)
-    this.syncSeatStacksFromGame();
   }
 
   private handleAction(
@@ -350,9 +364,6 @@ export class PokerRoomManager {
   ) {
     const betting = this.game.applyAction(playerId, action, amount);
     if (!betting) return;
-
-    // After server updates, keep the seat.chips in sync with betting stacks
-    this.syncSeatStacksFromGame();
 
     // Always broadcast updated betting state
     this.broadcast({
@@ -385,16 +396,15 @@ export class PokerRoomManager {
       });
     }
 
-    // If hand ended, compute and broadcast showdown
+    // If hand ended, compute and broadcast showdown + track fake rake
     if (betting.street === "done") {
-      // 👉 Fake rake: 5% of final pot (for logging only; pot already
-      // distributed by HoldemGame.computeShowdown)
+      // Fake rake: 5% of final pot
       const fakeRake = Math.floor((betting.pot * 5) / 100);
       this.totalFakeRake += fakeRake;
 
       console.log(
-        `[PokerRoom:${this.roomId}] Hand #${betting.handId} complete. ` +
-          `Pot=${betting.pot}, Fake rake (5%)=${fakeRake}, Total fake rake=${this.totalFakeRake}`
+        `[PokerRoom:${this.roomId}] Hand #${betting.handId} complete. Pot=${betting.pot}, ` +
+          `Fake rake (5%)=${fakeRake}, Total fake rake=${this.totalFakeRake}`
       );
 
       const showdown = this.game.computeShowdown();
@@ -410,36 +420,22 @@ export class PokerRoomManager {
         });
       }
 
-      // After showdown, seat stacks are final for this hand
-      this.syncSeatStacksFromGame();
-
       // Hand is over; allow new players to sit and new hand to start
       this.handInProgress = false;
     }
   }
 
-  // ───────────────── STACK SYNC HELPER ─────────────────
+  // ───────────────── GHOST / RESET HELPERS ─────────────────
 
-  /**
-   * Pulls current in-hand stacks from HoldemGame and
-   * mirrors them onto this.seats[].chips so the UI
-   * shows accurate chip stacks at each avatar.
-   */
-  private syncSeatStacksFromGame() {
-    const seatStacks = this.game.getSeatStacksForCurrentHand();
-    if (!seatStacks.length) return;
-
+  /** Remove seats that reference players who no longer have a live WebSocket */
+  private cleanupGhostSeats() {
+    const activeIds = new Set(this.clients.keys());
     let changed = false;
 
     this.seats = this.seats.map((s) => {
-      if (!s.playerId) return s;
-      const match = seatStacks.find(
-        (ss) => ss.seatIndex === s.seatIndex
-      );
-      if (!match) return s;
-      if (s.chips !== match.stack) {
+      if (s.playerId && !activeIds.has(s.playerId)) {
         changed = true;
-        return { ...s, chips: match.stack };
+        return { ...s, playerId: null, name: undefined, chips: 0 };
       }
       return s;
     });
@@ -453,6 +449,28 @@ export class PokerRoomManager {
         seats: this.seats,
       });
     }
+  }
+
+  /** When the last client leaves, fully reset seats + game state. */
+  private resetTableState() {
+    const freshSeats: SeatView[] = [];
+    for (let i = 0; i < 9; i++) {
+      freshSeats.push({
+        seatIndex: i,
+        playerId: null,
+        name: undefined,
+        chips: 0,
+      });
+    }
+
+    this.seats = freshSeats;
+    this.game = new HoldemGame();
+    this.handInProgress = false;
+    this.totalFakeRake = 0;
+
+    console.log(
+      `[PokerRoom:${this.roomId}] All clients gone. Resetting table state.`
+    );
   }
 
   // ───────────────── LOW-LEVEL SEND HELPERS ─────────────────
