@@ -637,313 +637,11 @@ export class HoldemGame {
   }
 
   // -------------------
-  // Full 7-card evaluator
+  // Hand ranking helpers
   // -------------------
-
-  private evaluateSevenCards(cards: Card[]): {
-    score: number;
-    rankName: string;
-    best5: Card[];
-  } {
-    // ranks + suits
-    const ranks: number[] = cards.map((c) => rankValue(c[0]));
-    const suits: string[] = cards.map((c) => c[1]);
-
-    const rankCounts: Record<number, number> = {};
-    const suitCounts: Record<string, number> = {};
-    for (let i = 0; i < cards.length; i++) {
-      const r = ranks[i];
-      const s = suits[i];
-      rankCounts[r] = (rankCounts[r] || 0) + 1;
-      suitCounts[s] = (suitCounts[s] || 0) + 1;
-    }
-
-    const uniqueRanksDesc = Array.from(new Set(ranks)).sort((a, b) => b - a);
-
-    let flushSuit: string | null = null;
-    for (const s of Object.keys(suitCounts)) {
-      if (suitCounts[s] >= 5) {
-        flushSuit = s;
-        break;
-      }
-    }
-
-    // ---------- Straight Flush / Royal ----------
-    if (flushSuit) {
-      const flushCards = cards.filter((c) => c[1] === flushSuit);
-      const flushRanks = flushCards.map((c) => rankValue(c[0]));
-      const flushUniqueDesc = Array.from(new Set(flushRanks)).sort(
-        (a, b) => b - a
-      );
-      const sfRanks = this.bestStraight(flushUniqueDesc);
-      if (sfRanks.length === 5) {
-        const best5 = this.pickCardsForRanks(flushCards, sfRanks);
-        const high = sfRanks[0];
-        let rankName = "";
-        if (high === 14 && sfRanks[4] === 10) {
-          rankName = "Royal flush";
-        } else {
-          const highName =
-            high === 14
-              ? "Ace-high"
-              : high === 13
-              ? "King-high"
-              : high === 12
-              ? "Queen-high"
-              : high === 11
-              ? "Jack-high"
-              : `${high}-high`;
-          rankName = `Straight flush (${highName})`;
-        }
-        const score = this.buildRankScore(8, sfRanks);
-        return { score, rankName, best5 };
-      }
-    }
-
-    // ---------- Count patterns ----------
-    const ranksByCountDesc = Object.keys(rankCounts)
-      .map((rStr) => {
-        const r = Number(rStr);
-        return { rank: r, count: rankCounts[r] };
-      })
-      .sort((a, b) => {
-        if (b.count !== a.count) return b.count - a.count;
-        return b.rank - a.rank;
-      });
-
-    const fourOf: number[] = [];
-    const trips: number[] = [];
-    const pairs: number[] = [];
-
-    for (const rc of ranksByCountDesc) {
-      if (rc.count === 4) fourOf.push(rc.rank);
-      else if (rc.count === 3) trips.push(rc.rank);
-      else if (rc.count === 2) pairs.push(rc.rank);
-    }
-
-    // ---------- Four of a kind ----------
-    if (fourOf.length > 0) {
-      const quadRank = fourOf[0];
-      const kickerRank =
-        uniqueRanksDesc.find((r) => r !== quadRank) ?? quadRank;
-      const ranksForScore = [quadRank, quadRank, quadRank, quadRank, kickerRank];
-      const best5 = this.pickCardsForRanks(cards, ranksForScore);
-      const label =
-        quadRank === 14
-          ? "Aces"
-          : quadRank === 13
-          ? "Kings"
-          : quadRank === 12
-          ? "Queens"
-          : quadRank === 11
-          ? "Jacks"
-          : `${quadRank}s`;
-      const rankName = `Four of ${label}`;
-      const score = this.buildRankScore(7, [quadRank, kickerRank]);
-      return { score, rankName, best5 };
-    }
-
-    // ---------- Full house ----------
-    if (trips.length > 0 && (trips.length > 1 || pairs.length > 0)) {
-      const tripRank = trips[0];
-      const restRanks = [...trips.slice(1), ...pairs];
-      const pairRank = restRanks[0];
-
-      const ranksForScore = [
-        tripRank,
-        tripRank,
-        tripRank,
-        pairRank,
-        pairRank,
-      ];
-      const best5 = this.pickCardsForRanks(cards, ranksForScore);
-      const tripLabel =
-        tripRank === 14
-          ? "Aces"
-          : tripRank === 13
-          ? "Kings"
-          : tripRank === 12
-          ? "Queens"
-          : tripRank === 11
-          ? "Jacks"
-          : `${tripRank}s`;
-      const pairLabel =
-        pairRank === 14
-          ? "Aces"
-          : pairRank === 13
-          ? "Kings"
-          : pairRank === 12
-          ? "Queens"
-          : pairRank === 11
-          ? "Jacks"
-          : `${pairRank}s`;
-      const rankName = `Full house, ${tripLabel} over ${pairLabel}`;
-      const score = this.buildRankScore(6, [tripRank, pairRank]);
-      return { score, rankName, best5 };
-    }
-
-    // ---------- Flush ----------
-    if (flushSuit) {
-      const flushCards = cards.filter((c) => c[1] === flushSuit);
-      const flushRanks = flushCards
-        .map((c) => rankValue(c[0]))
-        .sort((a, b) => b - a);
-      const flushUniqueDesc = Array.from(new Set(flushRanks)).sort(
-        (a, b) => b - a
-      );
-      const top5 = flushUniqueDesc.slice(0, 5);
-      const best5 = this.pickCardsForRanks(flushCards, top5);
-      const high = top5[0];
-      const label =
-        high === 14
-          ? "Ace-high"
-          : high === 13
-          ? "King-high"
-          : high === 12
-          ? "Queen-high"
-          : high === 11
-          ? "Jack-high"
-          : `${high}-high`;
-      const rankName = `Flush (${label})`;
-      const score = this.buildRankScore(5, top5);
-      return { score, rankName, best5 };
-    }
-
-    // ---------- Straight ----------
-    const straightRanks = this.bestStraight(uniqueRanksDesc);
-    if (straightRanks.length === 5) {
-      const best5 = this.pickCardsForRanks(cards, straightRanks);
-      const high = straightRanks[0];
-      const label =
-        high === 14
-          ? "Ace-high"
-          : high === 13
-          ? "King-high"
-          : high === 12
-          ? "Queen-high"
-          : high === 11
-          ? "Jack-high"
-          : `${high}-high`;
-      const rankName = `Straight (${label})`;
-      const score = this.buildRankScore(4, straightRanks);
-      return { score, rankName, best5 };
-    }
-
-    // ---------- Trips ----------
-    if (trips.length > 0) {
-      const tripRank = trips[0];
-      const kickers = uniqueRanksDesc.filter((r) => r !== tripRank).slice(0, 2);
-      const ranksForScore = [
-        tripRank,
-        tripRank,
-        tripRank,
-        ...(kickers.length === 2 ? kickers : [kickers[0] ?? tripRank, tripRank]),
-      ];
-      const best5 = this.pickCardsForRanks(cards, ranksForScore);
-      const label =
-        tripRank === 14
-          ? "Aces"
-          : tripRank === 13
-          ? "Kings"
-          : tripRank === 12
-          ? "Queens"
-          : tripRank === 11
-          ? "Jacks"
-          : `${tripRank}s`;
-      const rankName = `Three of a kind (${label})`;
-      const score = this.buildRankScore(3, [
-        tripRank,
-        ...(kickers as number[]),
-      ]);
-      return { score, rankName, best5 };
-    }
-
-    // ---------- Two pair ----------
-    if (pairs.length >= 2) {
-      const [highPair, lowPair] = pairs.slice(0, 2);
-      const kicker =
-        uniqueRanksDesc.find((r) => r !== highPair && r !== lowPair) ??
-        highPair;
-      const ranksForScore = [
-        highPair,
-        highPair,
-        lowPair,
-        lowPair,
-        kicker,
-      ];
-      const best5 = this.pickCardsForRanks(cards, ranksForScore);
-      const highLabel =
-        highPair === 14
-          ? "Aces"
-          : highPair === 13
-          ? "Kings"
-          : highPair === 12
-          ? "Queens"
-          : highPair === 11
-          ? "Jacks"
-          : `${highPair}s`;
-      const lowLabel =
-        lowPair === 14
-          ? "Aces"
-          : lowPair === 13
-          ? "Kings"
-          : lowPair === 12
-          ? "Queens"
-          : lowPair === 11
-          ? "Jacks"
-          : `${lowPair}s`;
-      const rankName = `Two pair (${highLabel} and ${lowLabel})`;
-      const score = this.buildRankScore(2, [highPair, lowPair, kicker]);
-      return { score, rankName, best5 };
-    }
-
-    // ---------- One pair ----------
-    if (pairs.length === 1) {
-      const pairRank = pairs[0];
-      const kickers = uniqueRanksDesc.filter((r) => r !== pairRank).slice(0, 3);
-      const ranksForScore = [
-        pairRank,
-        pairRank,
-        ...(kickers as number[]),
-      ];
-      const best5 = this.pickCardsForRanks(cards, ranksForScore);
-      const label =
-        pairRank === 14
-          ? "Aces"
-          : pairRank === 13
-          ? "Kings"
-          : pairRank === 12
-          ? "Queens"
-          : pairRank === 11
-          ? "Jacks"
-          : `${pairRank}s`;
-      const rankName = `Pair of ${label}`;
-      const score = this.buildRankScore(1, [pairRank, ...kickers]);
-      return { score, rankName, best5 };
-    }
-
-    // ---------- High card ----------
-    const top5 = uniqueRanksDesc.slice(0, 5);
-    const best5 = this.pickCardsForRanks(cards, top5);
-    const top = top5[0];
-    const label =
-      top === 14
-        ? "Ace"
-        : top === 13
-        ? "King"
-        : top === 12
-        ? "Queen"
-        : top === 11
-        ? "Jack"
-        : `${top}`;
-    const rankName = `High card ${label}`;
-    const score = this.buildRankScore(0, top5);
-    return { score, rankName, best5 };
-  }
 
   // Category: 0..8, ranksDesc: high-to-low kicker structure
   private buildRankScore(category: number, ranksDesc: number[]): number {
-    // category * 1e8 + r1*1e6 + r2*1e4 + r3*1e2 + r4*1e1 + r5
     const [r1, r2, r3, r4, r5] = [
       ranksDesc[0] ?? 0,
       ranksDesc[1] ?? 0,
@@ -961,74 +659,286 @@ export class HoldemGame {
     );
   }
 
-  // Find best straight from a list of unique ranks (desc)
-  private bestStraight(uniqueRanksDesc: number[]): number[] {
-    if (uniqueRanksDesc.length < 5) return [];
+  // Full 7-card evaluator – brute force all 21 combos of 5
+  private evaluateSevenCards(cards: Card[]): {
+    score: number;
+    rankName: string;
+    best5: Card[];
+  } {
+    if (cards.length !== 7) {
+      throw new Error(`evaluateSevenCards expects 7 cards, got ${cards.length}`);
+    }
 
-    // Work on ascending for scanning
-    const uniq = Array.from(new Set(uniqueRanksDesc));
-    let arr = uniq.slice().sort((a, b) => a - b);
+    let bestScore = -1;
+    let bestName = "High card";
+    let bestFive: Card[] = [];
 
-    // Wheel: if A,5,4,3,2 add A as rank 1
+    const n = cards.length;
+    for (let a = 0; a < n - 4; a++) {
+      for (let b = a + 1; b < n - 3; b++) {
+        for (let c = b + 1; c < n - 2; c++) {
+          for (let d = c + 1; d < n - 1; d++) {
+            for (let e = d + 1; e < n; e++) {
+              const combo = [cards[a], cards[b], cards[c], cards[d], cards[e]];
+              const { category, ranksDesc, rankName } =
+                this.evaluateFiveCards(combo);
+              const score = this.buildRankScore(category, ranksDesc);
+
+              if (score > bestScore) {
+                bestScore = score;
+                bestName = rankName;
+                bestFive = combo;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return {
+      score: bestScore,
+      rankName: bestName,
+      best5: bestFive,
+    };
+  }
+
+  /**
+   * Evaluate EXACTLY 5 cards.
+   * Returns:
+   *  - category: 0..8   (0=High card, 1=Pair, 2=Two pair, 3=Trips,
+   *                      4=Straight, 5=Flush, 6=Full house,
+   *                      7=Four of a kind, 8=Straight flush)
+   *  - ranksDesc: high->low ranks used for tie-breaking
+   *  - rankName: human text ("Full house, Kings over Tens")
+   */
+  private evaluateFiveCards(cards: Card[]): {
+    category: number;
+    ranksDesc: number[];
+    rankName: string;
+  } {
+    const ranks: number[] = cards.map((c) => rankValue(c[0]));
+    const suits: string[] = cards.map((c) => c[1]);
+    const uniqueRanksDesc = Array.from(new Set(ranks)).sort((a, b) => b - a);
+
+    const rankCounts: Record<number, number> = {};
+    const suitCounts: Record<string, number> = {};
+    for (let i = 0; i < cards.length; i++) {
+      const r = ranks[i];
+      const s = suits[i];
+      rankCounts[r] = (rankCounts[r] || 0) + 1;
+      suitCounts[s] = (suitCounts[s] || 0) + 1;
+    }
+
+    const groups = Object.keys(rankCounts)
+      .map((key) => {
+        const r = Number(key);
+        return { rank: r, count: rankCounts[r] };
+      })
+      .sort((a, b) => {
+        if (b.count !== a.count) return b.count - a.count;
+        return b.rank - a.rank;
+      });
+
+    const counts = groups.map((g) => g.count);
+    const topRank = groups[0]?.rank ?? 0;
+    const secondRank = groups[1]?.rank ?? 0;
+
+    const labelRankPlural = (r: number) =>
+      r === 14
+        ? "Aces"
+        : r === 13
+        ? "Kings"
+        : r === 12
+        ? "Queens"
+        : r === 11
+        ? "Jacks"
+        : `${r}s`;
+
+    const labelRankHigh = (r: number) =>
+      r === 14
+        ? "Ace-high"
+        : r === 13
+        ? "King-high"
+        : r === 12
+        ? "Queen-high"
+        : r === 11
+        ? "Jack-high"
+        : `${r}-high`;
+
+    // ----- Straight detection (handle wheel A-5) -----
+    let isStraight = false;
+    let straightHigh = 0;
+
+    const uniqAsc = Array.from(new Set(uniqueRanksDesc)).sort((a, b) => a - b);
+    let arr = uniqAsc.slice();
+
     if (arr.includes(14)) {
       arr.push(1);
     }
     arr = Array.from(new Set(arr)).sort((a, b) => a - b);
 
-    let bestHigh = 0;
-    let bestSeq: number[] = [];
-
+    let bestSeqHigh = 0;
     let run: number[] = [arr[0]];
     for (let i = 1; i < arr.length; i++) {
       if (arr[i] === arr[i - 1] + 1) {
         run.push(arr[i]);
       } else if (arr[i] !== arr[i - 1]) {
         if (run.length >= 5) {
-          const candidate = run.slice(-5);
-          const high = candidate[candidate.length - 1];
-          if (high > bestHigh) {
-            bestHigh = high;
-            bestSeq = candidate.slice();
+          const cand = run.slice(-5);
+          const hi = cand[cand.length - 1];
+          if (hi > bestSeqHigh) {
+            bestSeqHigh = hi;
           }
         }
         run = [arr[i]];
       }
     }
     if (run.length >= 5) {
-      const candidate = run.slice(-5);
-      const high = candidate[candidate.length - 1];
-      if (high > bestHigh) {
-        bestHigh = high;
-        bestSeq = candidate.slice();
+      const cand = run.slice(-5);
+      const hi = cand[cand.length - 1];
+      if (hi > bestSeqHigh) {
+        bestSeqHigh = hi;
       }
     }
 
-    if (bestSeq.length === 0) return [];
+    if (bestSeqHigh > 0) {
+      isStraight = true;
+      straightHigh = bestSeqHigh === 1 ? 5 : bestSeqHigh;
+    }
 
-    const resultAsc = bestSeq.map((r) => (r === 1 ? 14 : r));
-    return resultAsc.sort((a, b) => b - a);
-  }
-
-  // Pick actual cards matching a high->low rank pattern
-  private pickCardsForRanks(cards: Card[], targetRanksDesc: number[]): Card[] {
-    const result: Card[] = [];
-    const remaining = cards.slice();
-
-    for (const target of targetRanksDesc) {
-      for (let i = 0; i < remaining.length; i++) {
-        const c = remaining[i];
-        const r = rankValue(c[0]);
-        if (r === target) {
-          result.push(c);
-          remaining.splice(i, 1);
-          break;
-        }
+    // ----- Flush detection -----
+    let flushSuit: string | null = null;
+    for (const s of Object.keys(suitCounts)) {
+      if (suitCounts[s] === 5) {
+        flushSuit = s;
+        break;
       }
     }
-    // If somehow fewer than 5, just pad with highest remaining (should be rare)
-    while (result.length < 5 && remaining.length > 0) {
-      result.push(remaining.shift() as Card);
+    const isFlush = !!flushSuit;
+
+    // ----- Straight flush / Royal -----
+    if (isFlush && isStraight) {
+      const sfHigh = straightHigh;
+      if (sfHigh === 14) {
+        return {
+          category: 8,
+          ranksDesc: [14, 13, 12, 11, 10],
+          rankName: "Royal flush",
+        };
+      }
+      return {
+        category: 8,
+        ranksDesc: [sfHigh],
+        rankName: `Straight flush (${labelRankHigh(sfHigh)})`,
+      };
     }
-    return result.slice(0, 5);
+
+    // ----- Four of a kind -----
+    if (counts[0] === 4) {
+      const quadRank = topRank;
+      const kickerRank =
+        uniqueRanksDesc.find((r) => r !== quadRank) ?? quadRank;
+      return {
+        category: 7,
+        ranksDesc: [quadRank, kickerRank],
+        rankName: `Four of ${labelRankPlural(quadRank)}`,
+      };
+    }
+
+    // ----- Full house -----
+    if (counts[0] === 3 && (counts[1] === 3 || counts[1] === 2)) {
+      const tripRank = topRank;
+      const pairRank = secondRank;
+      return {
+        category: 6,
+        ranksDesc: [tripRank, pairRank],
+        rankName: `Full house, ${labelRankPlural(
+          tripRank
+        )} over ${labelRankPlural(pairRank)}`,
+      };
+    }
+
+    // ----- Flush -----
+    if (isFlush) {
+      const sortedFlush = ranks.slice().sort((a, b) => b - a);
+      const top5 = sortedFlush.slice(0, 5);
+      const high = top5[0];
+      return {
+        category: 5,
+        ranksDesc: top5,
+        rankName: `Flush (${labelRankHigh(high)})`,
+      };
+    }
+
+    // ----- Straight -----
+    if (isStraight) {
+      return {
+        category: 4,
+        ranksDesc: [straightHigh],
+        rankName: `Straight (${labelRankHigh(straightHigh)})`,
+      };
+    }
+
+    // ----- Three of a kind -----
+    if (counts[0] === 3) {
+      const tripRank = topRank;
+      const kickers = uniqueRanksDesc
+        .filter((r) => r !== tripRank)
+        .slice(0, 2);
+      return {
+        category: 3,
+        ranksDesc: [tripRank, ...kickers],
+        rankName: `Three of a kind (${labelRankPlural(tripRank)})`,
+      };
+    }
+
+    // ----- Two pair -----
+    if (counts[0] === 2 && counts[1] === 2) {
+      const pair1 = topRank;
+      const pair2 = secondRank;
+      const hiPair = Math.max(pair1, pair2);
+      const loPair = Math.min(pair1, pair2);
+      const kicker =
+        uniqueRanksDesc.find((r) => r !== hiPair && r !== loPair) ?? hiPair;
+      return {
+        category: 2,
+        ranksDesc: [hiPair, loPair, kicker],
+        rankName: `Two pair (${labelRankPlural(
+          hiPair
+        )} and ${labelRankPlural(loPair)})`,
+      };
+    }
+
+    // ----- One pair -----
+    if (counts[0] === 2) {
+      const pairRank = topRank;
+      const kickers = uniqueRanksDesc
+        .filter((r) => r !== pairRank)
+        .slice(0, 3);
+      return {
+        category: 1,
+        ranksDesc: [pairRank, ...kickers],
+        rankName: `Pair of ${labelRankPlural(pairRank)}`,
+      };
+    }
+
+    // ----- High card -----
+    const top5 = uniqueRanksDesc.slice(0, 5);
+    const high = top5[0];
+    const highLabel =
+      high === 14
+        ? "Ace"
+        : high === 13
+        ? "King"
+        : high === 12
+        ? "Queen"
+        : high === 11
+        ? "Jack"
+        : `${high}`;
+    return {
+      category: 0,
+      ranksDesc: top5,
+      rankName: `High card ${highLabel}`,
+    };
   }
 }
