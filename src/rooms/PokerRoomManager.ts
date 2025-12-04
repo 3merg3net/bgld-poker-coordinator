@@ -171,7 +171,7 @@ export class PokerRoomManager {
         this.handleAction(msg.playerId, msg.action, msg.amount);
         break;
 
-      // 👇 NEW: client asks server to reveal their hole cards to everyone
+      // client asks server to reveal their hole cards to everyone
       case "show-cards":
         this.handleShowCards(msg.playerId);
         break;
@@ -190,18 +190,9 @@ export class PokerRoomManager {
     seatIndex?: number,
     name?: string
   ) {
-    // If a hand is running, don't let new players pop in mid-hand
-    if (this.handInProgress) {
-      this.sendTo(playerId, {
-        kind: "poker",
-        roomId: this.roomId,
-        playerId,
-        type: "error",
-        message:
-          "A hand is currently in progress. Please wait for this hand to finish before sitting.",
-      });
-      return;
-    }
+    // ✅ GG-style: allow sitting mid-hand.
+    // New players won't appear in the current betting state,
+    // so they simply wait and are dealt in on the *next* hand.
 
     // If already seated, ignore
     const already = this.seats.find((s) => s.playerId === playerId);
@@ -251,6 +242,9 @@ export class PokerRoomManager {
       type: "seats-update",
       seats: this.seats,
     });
+
+    // Optional: you could also broadcast a chat-style system message here
+    // saying "X sits and will be dealt next hand", but not required.
   }
 
   private handleStand(playerId: string) {

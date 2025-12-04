@@ -29,11 +29,11 @@ export type ServerToClientMessage =
   | (MessageBase & {
       type: "table-state";
       handId: number;
-      board: string[]; // ← relaxed from Card[]
+      board: string[]; // relaxed from Card[]
       players: {
         seatIndex: number;
         playerId: string;
-        holeCards: string[]; // ← relaxed from Card[]
+        holeCards: string[]; // relaxed from Card[]
       }[];
     })
   | (MessageBase & {
@@ -59,24 +59,25 @@ export type ServerToClientMessage =
   | (MessageBase & {
       type: "showdown";
       handId: number;
-      board: string[]; // ← relaxed from Card[]
+      board: string[]; // relaxed from Card[]
       players: {
         seatIndex: number;
         playerId: string;
-        holeCards: string[]; // ← relaxed from Card[]
-        bestHand: string[];  // ← relaxed from Card[]
+        holeCards: string[]; // relaxed from Card[]
+        bestHand: string[];  // relaxed from Card[]
         rankName: string;
         isWinner: boolean;
       }[];
     })
-    | {
-    kind: "poker";
-    roomId: string;
-    playerId: string; // the one showing
-    type: "player-show-cards";
-    cards: string[];  // ["Ah","Kd"]
-  }
-
+  // Player explicitly reveals their own hole cards to the table
+  | (MessageBase & {
+      type: "player-show-cards";
+      cards: string[]; // ["Ah", "Kd"]
+    })
+  // Lightweight presence messages so UI can show reconnect / offline badges
+  | (MessageBase & {
+      type: "player-reconnected" | "player-offline";
+    })
   | (MessageBase & {
       type: "error";
       message: string;
