@@ -171,7 +171,7 @@ export class PokerRoomManager {
         this.handleAction(msg.playerId, msg.action, msg.amount);
         break;
 
-      // client asks server to reveal their hole cards to everyone
+      // client asks server to reveal *their* hole cards to everyone
       case "show-cards":
         this.handleShowCards(msg.playerId);
         break;
@@ -243,8 +243,7 @@ export class PokerRoomManager {
       seats: this.seats,
     });
 
-    // Optional: you could also broadcast a chat-style system message here
-    // saying "X sits and will be dealt next hand", but not required.
+    // Optional: system chat "X sits and will be dealt next hand."
   }
 
   private handleStand(playerId: string) {
@@ -408,6 +407,8 @@ export class PokerRoomManager {
 
       const showdown = this.game.computeShowdown();
       if (showdown) {
+        // ⬇️ No enrichment here – just pass through.
+        // Front-end will only see what computeShowdown() returns.
         this.broadcast({
           kind: "poker",
           roomId: this.roomId,
@@ -425,7 +426,7 @@ export class PokerRoomManager {
   }
 
   /**
-   * Player requests to show their hole cards to the table.
+   * Player requests to show *their* hole cards to the table.
    * We only allow this after river (street === "done").
    */
   private handleShowCards(playerId: string) {
@@ -435,9 +436,17 @@ export class PokerRoomManager {
       return;
     }
 
-    // This helper must exist on HoldemGame:
+    // Optional helper on HoldemGame:
     // getHoleCardsForPlayer(playerId: string): string[] | null
-    const hole = this.game.getHoleCardsForPlayer(playerId);
+    const anyGame: any = this.game as any;
+    if (typeof anyGame.getHoleCardsForPlayer !== "function") {
+      return;
+    }
+
+    const hole = anyGame.getHoleCardsForPlayer(playerId) as
+      | string[]
+      | null
+      | undefined;
     if (!hole || hole.length !== 2) return;
 
     this.broadcast({
