@@ -113,6 +113,9 @@ export class HoldemGame {
 
   // PUBLIC API used by PokerRoomManager
   // -----------------------------------
+getHoleCardsForPlayer(playerId: string): string[] | null {
+  return null;
+}
 
   getLastState(): TableState | null {
     return this.lastTable;

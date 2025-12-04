@@ -69,6 +69,14 @@ export type ServerToClientMessage =
         isWinner: boolean;
       }[];
     })
+    | {
+    kind: "poker";
+    roomId: string;
+    playerId: string; // the one showing
+    type: "player-show-cards";
+    cards: string[];  // ["Ah","Kd"]
+  }
+
   | (MessageBase & {
       type: "error";
       message: string;

@@ -171,6 +171,11 @@ export class PokerRoomManager {
         this.handleAction(msg.playerId, msg.action, msg.amount);
         break;
 
+      // 👇 NEW: client asks server to reveal their hole cards to everyone
+      case "show-cards":
+        this.handleShowCards(msg.playerId);
+        break;
+
       default:
         // join/leave handled at connection level
         break;
@@ -423,6 +428,31 @@ export class PokerRoomManager {
       // Hand is over; allow new players to sit and new hand to start
       this.handInProgress = false;
     }
+  }
+
+  /**
+   * Player requests to show their hole cards to the table.
+   * We only allow this after river (street === "done").
+   */
+  private handleShowCards(playerId: string) {
+    const betting = this.game.getBettingState();
+    if (!betting || betting.street !== "done") {
+      // Don’t reveal mid-hand
+      return;
+    }
+
+    // This helper must exist on HoldemGame:
+    // getHoleCardsForPlayer(playerId: string): string[] | null
+    const hole = this.game.getHoleCardsForPlayer(playerId);
+    if (!hole || hole.length !== 2) return;
+
+    this.broadcast({
+      kind: "poker",
+      roomId: this.roomId,
+      playerId,
+      type: "player-show-cards",
+      cards: hole, // e.g. ["Ah", "Kd"]
+    } as ServerToClientMessage);
   }
 
   // ───────────────── GHOST / RESET HELPERS ─────────────────

@@ -36,6 +36,13 @@ export type ClientToServerMessage =
   | (MessageBase & {
       type: "start-hand";
     })
+    | {
+    kind: "poker";
+    roomId: string;
+    playerId: string;
+    type: "show-cards";
+  }
+
   // Player betting action
   | (MessageBase & {
       type: "action";
