@@ -1,84 +1,74 @@
 // src/types/ServerToClient.ts
 import type { MessageBase } from "./shared";
+import type { Card } from "../game/cards";
 
-export type ServerToClientMessage =
-  | (MessageBase & {
-      type: "room-joined";
-      onlineCount: number;
-    })
-  | (MessageBase & {
-      type: "room-left";
-    })
-  | (MessageBase & {
-      type: "pong";
-      payload?: string;
-    })
-  | (MessageBase & {
-      type: "chat-broadcast";
-      text: string;
-    })
-  | (MessageBase & {
-      type: "seats-update";
-      seats: {
-        seatIndex: number;
-        playerId: string | null;
-        name?: string;
-        chips?: number;
-      }[];
-    })
-  | (MessageBase & {
-      type: "table-state";
-      handId: number;
-      board: string[]; // relaxed from Card[]
-      players: {
-        seatIndex: number;
-        playerId: string;
-        holeCards: string[]; // relaxed from Card[]
-      }[];
-    })
-  | (MessageBase & {
-      type: "betting-state";
-      handId: number;
-      street: "preflop" | "flop" | "turn" | "river" | "done";
-      pot: number;
-      buttonSeatIndex: number;
-      currentSeatIndex: number | null;
-      bigBlind: number;
-      smallBlind: number;
-      maxCommitted: number;
-      players: {
-        seatIndex: number;
-        playerId: string;
-        stack: number;
-        inHand: boolean;
-        hasFolded: boolean;
-        hasActed: boolean;
-        committed: number;
-      }[];
-    })
-  | (MessageBase & {
-      type: "showdown";
-      handId: number;
-      board: string[]; // relaxed from Card[]
-      players: {
-        seatIndex: number;
-        playerId: string;
-        holeCards: string[]; // relaxed from Card[]
-        bestHand: string[];  // relaxed from Card[]
-        rankName: string;
-        isWinner: boolean;
-      }[];
-    })
-  // Player explicitly reveals their own hole cards to the table
-  | (MessageBase & {
-      type: "player-show-cards";
-      cards: string[]; // ["Ah", "Kd"]
-    })
-  // Lightweight presence messages so UI can show reconnect / offline badges
-  | (MessageBase & {
-      type: "player-reconnected" | "player-offline";
-    })
-  | (MessageBase & {
-      type: "error";
-      message: string;
-    });
+
+export type ServerToClientMessage = MessageBase & {
+  // e.g. "table-state", "chat", "blackjack-state"…
+  type: string;
+  [key: string]: any;
+};
+
+/**
+ * Blackjack view types
+ * (only used for typing / FE — coordinator just sends plain objects)
+ */
+
+export type BlackjackPhase =
+  | "waiting-bets"
+  | "dealing"
+  | "player-action"
+  | "dealer-turn"
+  | "round-complete";
+
+export type BlackjackCard = Card;
+ // same "As", "Td" style as cards.ts
+
+export type BlackjackHandResult =
+  | "pending"
+  | "win"
+  | "lose"
+  | "push"
+  | "blackjack";
+
+export type BlackjackHandState = {
+  handIndex: number;
+  cards: BlackjackCard[];
+  bet: number;
+  isBusted: boolean;
+  isStanding: boolean;
+  isBlackjack: boolean;
+  result: BlackjackHandResult;
+  // net change to bankroll after settlement (can be negative)
+  payout: number;
+};
+
+export type BlackjackSeatState = {
+  seatIndex: number;
+  playerId: string | null;
+  name?: string;
+  bankroll: number;
+  hands: BlackjackHandState[];
+};
+
+export type BlackjackDealerState = {
+  // we allow a face-down marker like "XX" so keep this as string[]
+  cards: string[];
+  hideHoleCard: boolean;
+};
+
+
+export type BlackjackTableState = {
+  roundId: number;
+  phase: BlackjackPhase;
+  minBet: number;
+  maxBet: number;
+  activeSeatIndex: number | null;
+  activeHandIndex: number | null;
+  dealer: BlackjackDealerState;
+  seats: BlackjackSeatState[];
+
+  // 👇 NEW: optional betting deadline for countdown UI
+  betDeadlineMs?: number | null;
+};
+

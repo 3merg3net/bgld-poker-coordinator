@@ -1,8 +1,8 @@
 // src/types/shared.ts
 
-// Base shape for all poker messages
+// Base shape for all messages
 export type MessageBase = {
-  kind: "poker";
+  kind: "poker" | "blackjack";  // ⬅️ add "blackjack" here
   roomId: string;
   playerId: string;
 };

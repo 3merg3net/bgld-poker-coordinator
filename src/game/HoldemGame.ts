@@ -45,6 +45,8 @@ export type BettingState = {
   smallBlind: number;
   maxCommitted: number;      // highest committed on this street
   players: BettingPlayerState[];
+   smallBlindSeatIndex?: number | null;
+  bigBlindSeatIndex?: number | null;
 };
 
 // Showdown state broadcast
@@ -111,11 +113,20 @@ export class HoldemGame {
   private seatsSnapshot: SeatView[] = [];
   private buttonSeatIndex: number | null = null;
 
-  // PUBLIC API used by PokerRoomManager
+  
+  
+    // PUBLIC API used by PokerRoomManager
   // -----------------------------------
-getHoleCardsForPlayer(playerId: string): string[] | null {
-  return null;
-}
+  getHoleCardsForPlayer(playerId: string): string[] | null {
+    if (!this.lastTable) return null;
+
+    const tp = this.lastTable.players.find(
+      (p) => p.playerId === playerId
+    );
+
+    return tp ? tp.holeCards.slice() : null;
+  }
+
 
   getLastState(): TableState | null {
     return this.lastTable;
@@ -265,7 +276,7 @@ getHoleCardsForPlayer(playerId: string): string[] | null {
       );
     }
 
-    this.betting = {
+        this.betting = {
       handId,
       street: "preflop",
       pot,
@@ -275,7 +286,10 @@ getHoleCardsForPlayer(playerId: string): string[] | null {
       smallBlind,
       maxCommitted,
       players: bettingPlayers,
+      smallBlindSeatIndex: smallBlindSeat,
+      bigBlindSeatIndex: bigBlindSeat,
     };
+
 
     this.showdown = null;
 
@@ -385,6 +399,22 @@ getHoleCardsForPlayer(playerId: string): string[] | null {
       const hole = tp.holeCards;
       const seven = [...hole, ...board];
 
+      // Early-fold / incomplete-board case:
+      // e.g. everyone folds preflop or on the flop/turn, so board.length < 5
+      // In that case we *do not* call evaluateSevenCards (which expects 7 cards).
+      if (seven.length < 7) {
+        evals.push({
+          bp,
+          eval: {
+            score: 1,                 // any positive score, only player left anyway
+            rankName: "Wins by fold", // label for the client
+            best5: seven,             // might be < 5, frontend can still show something
+          },
+        });
+        continue;
+      }
+
+      // Normal full-board showdown (7 cards: 2 hole + 5 board)
       const ev = this.evaluateSevenCards(seven);
       evals.push({ bp, eval: ev });
     }
@@ -668,8 +698,17 @@ getHoleCardsForPlayer(playerId: string): string[] | null {
     rankName: string;
     best5: Card[];
   } {
+    // 1.1 – Defensive guard, so we don’t crash if something upstream is off
     if (cards.length !== 7) {
-      throw new Error(`evaluateSevenCards expects 7 cards, got ${cards.length}`);
+      console.error(
+        `evaluateSevenCards expects 7 cards, got ${cards.length}`,
+        cards
+      );
+      return {
+        score: 0,
+        rankName: "No hand",
+        best5: cards.slice(0, 5),
+      };
     }
 
     let bestScore = -1;

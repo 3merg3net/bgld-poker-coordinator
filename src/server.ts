@@ -1,105 +1,153 @@
 // src/server.ts
 import { WebSocketServer } from "ws";
 import type WebSocket from "ws";
-import { ClientToServerMessage } from "./types/ClientToServer";
+
+import type { ClientToServerMessage } from "./types/ClientToServer";
 import { PokerRoomManager } from "./rooms/PokerRoomManager";
+import { BlackjackRoomManager } from "./rooms/BlackjackRoomManager";
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
 
-// Keep one instance per room
-const rooms = new Map<string, PokerRoomManager>();
+// Separate maps for each game type
+const pokerRooms = new Map<string, PokerRoomManager>();
+const blackjackRooms = new Map<string, BlackjackRoomManager>();
 
-function getRoom(roomId: string): PokerRoomManager {
-  let room = rooms.get(roomId);
+function getPokerRoom(roomId: string): PokerRoomManager {
+  let room = pokerRooms.get(roomId);
   if (!room) {
     room = new PokerRoomManager(roomId);
-    rooms.set(roomId, room);
+    pokerRooms.set(roomId, room);
   }
   return room;
 }
 
+function getBlackjackRoom(roomId: string): BlackjackRoomManager {
+  let room = blackjackRooms.get(roomId);
+  if (!room) {
+    room = new BlackjackRoomManager(roomId);
+    blackjackRooms.set(roomId, room);
+  }
+  return room;
+}
+
+console.log(`[Coordinator] Starting WS server on port ${PORT}`);
 const wss = new WebSocketServer({ port: PORT });
 
-console.log(`[Coordinator] WebSocket server listening on :${PORT}`);
-
 wss.on("connection", (socket: WebSocket) => {
-  console.log("[Coordinator] New WebSocket client connected");
+  console.log("[Coordinator] New client connected");
 
   let currentRoomId: string | null = null;
   let currentPlayerId: string | null = null;
+  let currentKind: "poker" | "blackjack" | null = null;
 
-  // ───────────────── HEARTBEAT KEEPALIVE ─────────────────
-  // Simple keepalive so Railway / proxies see activity and don't kill idle sockets
-  let heartbeatTimer: any = null;
-
-  const startHeartbeat = () => {
-    if (heartbeatTimer) return;
-    heartbeatTimer = setInterval(() => {
-      if (socket.readyState === socket.OPEN) {
-        const hb = {
-          kind: "poker",
-          type: "heartbeat",
-          ts: Date.now(),
-        };
-        try {
-          socket.send(JSON.stringify(hb));
-        } catch (err) {
-          console.error("[Coordinator] Failed to send heartbeat:", err);
-        }
-      } else {
-        if (heartbeatTimer) {
-          clearInterval(heartbeatTimer);
-          heartbeatTimer = null;
-        }
+  // (optional) heartbeat – keep for now
+  let heartbeatTimer: NodeJS.Timeout | null = setInterval(() => {
+    if (socket.readyState === socket.OPEN) {
+      try {
+        socket.ping();
+      } catch (err) {
+        console.warn("[Coordinator] ping error:", err);
       }
-    }, 25000);
-  };
+    }
+  }, 30_000);
 
-  startHeartbeat();
-  // ─────────────── END HEARTBEAT KEEPALIVE ───────────────
+  socket.on("message", (data: WebSocket.RawData) => {
+    let msg: ClientToServerMessage | null = null;
 
-  socket.on("message", (rawData: WebSocket.RawData) => {
     try {
-      const msg = JSON.parse(rawData.toString()) as ClientToServerMessage;
+      msg = JSON.parse(String(data)) as ClientToServerMessage;
+    } catch (err) {
+      console.warn("[Coordinator] Failed to parse message:", err);
+      return;
+    }
 
-      // Ignore non-poker messages
-      if (msg.kind !== "poker") return;
+    if (!msg) return;
 
-      const room = getRoom(msg.roomId);
+    // We now support both poker + blackjack kinds
+    if (msg.kind !== "poker" && msg.kind !== "blackjack") {
+      // ignore unknown game kinds
+      return;
+    }
 
-      // First message MUST be join-room
-      if (!currentRoomId || !currentPlayerId) {
-        if (msg.type !== "join-room") {
-          console.warn("[Coordinator] First message must be join-room.");
-          return;
-        }
+    console.log("[Coordinator] Incoming message:", msg);
 
-        currentRoomId = msg.roomId;
-        currentPlayerId = msg.playerId;
+    // JOIN ROOM – same shape for both games
+    if (msg.type === "join-room") {
+      const { roomId, playerId, kind } = msg;
 
-        // Register client with the room manager
-        room.addClient(currentPlayerId, socket, (msg as any).name);
-
-        // Room manager is responsible for sending any initial state
+      if (!roomId || !playerId) {
+        console.warn("[Coordinator] join-room missing roomId/playerId");
         return;
       }
 
-      // Forward subsequent messages to the room manager
+      // track what this socket belongs to
+      currentRoomId = roomId;
+      currentPlayerId = playerId;
+      currentKind = kind;
+
+      if (kind === "poker") {
+        const room = getPokerRoom(roomId);
+        room.addClient(playerId, socket, (msg as any).name);
+      } else if (kind === "blackjack") {
+        const room = getBlackjackRoom(roomId);
+        room.addClient(playerId, socket, (msg as any).name);
+      }
+
+      return;
+    }
+
+    // Everything else gets routed to the appropriate room manager
+    if (!currentRoomId || !currentPlayerId || !currentKind) {
+      console.warn(
+        "[Coordinator] Got message before join-room; ignoring:",
+        msg
+      );
+      return;
+    }
+
+    if (currentKind === "poker") {
+      const room = pokerRooms.get(currentRoomId);
+      if (!room) {
+        console.warn(
+          "[Coordinator] No poker room found for",
+          currentRoomId,
+          "message:",
+          msg
+        );
+        return;
+      }
       room.handleMessage(msg);
-    } catch (err) {
-      console.error("[Coordinator] Failed to process message:", err);
+    } else if (currentKind === "blackjack") {
+      const room = blackjackRooms.get(currentRoomId);
+      if (!room) {
+        console.warn(
+          "[Coordinator] No blackjack room found for",
+          currentRoomId,
+          "message:",
+          msg
+        );
+        return;
+      }
+      room.handleMessage(msg);
     }
   });
 
   socket.on("close", () => {
     console.log("[Coordinator] Client disconnected");
+
     if (heartbeatTimer) {
       clearInterval(heartbeatTimer);
       heartbeatTimer = null;
     }
-    if (currentRoomId && currentPlayerId) {
-      const room = rooms.get(currentRoomId);
-      room?.removeClient(currentPlayerId);
+
+    if (currentRoomId && currentPlayerId && currentKind) {
+      if (currentKind === "poker") {
+        const room = pokerRooms.get(currentRoomId);
+        room?.removeClient(currentPlayerId);
+      } else if (currentKind === "blackjack") {
+        const room = blackjackRooms.get(currentRoomId);
+        room?.removeClient(currentPlayerId);
+      }
     }
   });
 
