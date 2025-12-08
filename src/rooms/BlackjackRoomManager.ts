@@ -17,14 +17,12 @@ const START_BANKROLL = 10_000;
 const MIN_BET = 50;
 const MAX_BET = 5_000;
 
-// ---------- helpers ----------
-
 function handValue(cards: Card[]): { total: number; soft: boolean } {
   let total = 0;
   let aces = 0;
 
   for (const c of cards) {
-    const rank = c[0]; // "A", "K", "Q", "J", "T", "9"...
+    const rank = c[0]; // "A", "K", "Q", "J", "T", "9", ...
     if (rank === "A") {
       aces += 1;
       total += 11;
@@ -52,18 +50,13 @@ function isBlackjack(cards: Card[]): boolean {
   return handValue(cards).total === 21;
 }
 
-// ---------- types inside room ----------
-
 type InternalHand = BlackjackHandState;
-
 type InternalSeat = BlackjackSeatState;
 
 type ClientInfo = {
   socket: WebSocket;
   name?: string;
 };
-
-// ---------- BlackjackRoomManager ----------
 
 export class BlackjackRoomManager {
   readonly roomId: string;
@@ -77,12 +70,15 @@ export class BlackjackRoomManager {
   private activeSeatIndex: number | null = null;
   private activeHandIndex: number | null = null;
 
-    private betDeadline: number | null = null;
+  private betDeadline: number | null = null;
   private betTimer: NodeJS.Timeout | null = null;
-  private static readonly BET_WINDOW_MS = 15000; // 15s window
+  private roundCompleteTimeout: NodeJS.Timeout | null = null;
+
+  private static readonly BET_WINDOW_MS = 15_000; // 15s window
 
   constructor(roomId: string) {
     this.roomId = roomId;
+
     for (let i = 0; i < MAX_SEATS; i++) {
       this.seats.push({
         seatIndex: i,
@@ -91,6 +87,7 @@ export class BlackjackRoomManager {
         hands: [],
       });
     }
+
     this.resetShoe();
     console.log(`[BlackjackRoomManager] Created room ${roomId}`);
   }
@@ -118,8 +115,6 @@ export class BlackjackRoomManager {
     return card;
   }
 
-  
-
   // ---- public API called from server.ts ----
 
   addClient(playerId: string, socket: WebSocket, name?: string) {
@@ -127,7 +122,6 @@ export class BlackjackRoomManager {
     console.log(
       `[BlackjackRoomManager] Player ${playerId} connected to room ${this.roomId}`
     );
-    // send initial snapshot
     this.broadcastState();
   }
 
@@ -161,86 +155,104 @@ export class BlackjackRoomManager {
         this.handleAction(msg);
         break;
       default:
-        // ignore unknown
         break;
     }
   }
 
   // ---- seat management ----
 
- // ---- seat management ----
-private handleSeatMessage(msg: ClientToServerMessage) {
-  const { playerId } = msg;
-  const action = msg.action as "sit" | "leave" | undefined;
-  const seatIndex = typeof msg.seatIndex === "number" ? msg.seatIndex : -1;
-  const name = typeof msg.name === "string" ? msg.name : undefined;
+  private handleSeatMessage(msg: ClientToServerMessage) {
+    const { playerId } = msg;
+    const action = msg.action as "sit" | "leave" | undefined;
+    const seatIndex = typeof msg.seatIndex === "number" ? msg.seatIndex : -1;
+    const name = typeof msg.name === "string" ? msg.name : undefined;
 
-  if (!action || seatIndex < 0 || seatIndex >= MAX_SEATS) return;
+    if (!action || seatIndex < 0 || seatIndex >= MAX_SEATS) return;
 
-  const seat = this.seats[seatIndex];
+    const seat = this.seats[seatIndex];
 
-  if (action === "sit") {
-    // Block ONLY if another player already owns this seat
-    if (seat.playerId && seat.playerId !== playerId) {
-      this.sendError(playerId, "Seat already taken");
-      return;
-    }
+    if (action === "sit") {
+      // Block ONLY if another player already owns this seat
+      if (seat.playerId && seat.playerId !== playerId) {
+        this.sendError(playerId, "Seat already taken");
+        return;
+      }
 
-    // Allow the same player to occupy multiple seats
-    seat.playerId = playerId;
-    if (name) seat.name = name;
-    if (!seat.bankroll && seat.bankroll !== 0) {
-      seat.bankroll = START_BANKROLL;
-    }
+      seat.playerId = playerId;
+      if (name) seat.name = name;
+      if (!seat.bankroll && seat.bankroll !== 0) {
+        seat.bankroll = START_BANKROLL;
+      }
 
-    console.log(
-      `[BlackjackRoomManager] Player ${playerId} sat in seat ${seatIndex}`
-    );
-  } else if (action === "leave") {
-    if (seat.playerId === playerId) {
-      seat.playerId = null;
-      seat.hands = [];
       console.log(
-        `[BlackjackRoomManager] Player ${playerId} left seat ${seatIndex}`
+        `[BlackjackRoomManager] Player ${playerId} sat in seat ${seatIndex}`
       );
+    } else if (action === "leave") {
+      if (seat.playerId === playerId) {
+        seat.playerId = null;
+        seat.hands = [];
+        console.log(
+          `[BlackjackRoomManager] Player ${playerId} left seat ${seatIndex}`
+        );
+      }
     }
+
+    this.broadcastState();
   }
 
-  this.broadcastState();
-}
+  // ---- betting + round lifecycle ----
 
-  /**
-   * If there are no active hands in progress, normalize the table
-   * back into "waiting-bets" and clear dealer cards.
-   * This prevents getting stuck in player-action with no players.
-   */
-  private ensureBettingPhase() {
-    // Any hand that is mid-round?
-    const anyActiveHand = this.seats.some((seat) =>
-      seat.hands.some((h) =>
-        h.bet > 0 &&
-        h.cards.length > 0 &&
-        h.result === "pending" &&
-        !h.isBusted &&
-        !h.isStanding
-      )
-    );
+  private openBetWindow() {
+    // clear any previous timer just in case
+    if (this.betTimer) {
+      clearTimeout(this.betTimer);
+      this.betTimer = null;
+    }
 
-    if (!anyActiveHand) {
-      // Table is effectively idle → reset into betting state
+    this.phase = "waiting-bets";
+    this.betDeadline = Date.now() + BlackjackRoomManager.BET_WINDOW_MS;
+
+    // timer that actually decides when to deal
+    this.betTimer = setTimeout(() => {
+      this.betTimer = null;
+      this.betDeadline = null;
+
+      const anyBet = this.seats.some((s) =>
+        s.hands.some((h) => h.bet > 0)
+      );
+
+      if (!anyBet) {
+        // no bets – stay in waiting-bets with empty dealer
+        this.phase = "waiting-bets";
+        this.dealerCards = [];
+        this.activeSeatIndex = null;
+        this.activeHandIndex = null;
+        this.broadcastState();
+        return;
+      }
+
+      // we have at least one bet – deal the round to all betting seats
+      this.startRound();
+    }, BlackjackRoomManager.BET_WINDOW_MS);
+  }
+
+  private handlePlaceBet(msg: ClientToServerMessage) {
+    // Allow placing bet either:
+    // - in waiting-bets, or
+    // - right after a round (round-complete) to kick off the next one.
+    if (this.phase === "round-complete") {
+      // Clear the "auto next" timer and reset into fresh betting state.
+      this.clearRoundCompleteTimeout();
       this.phase = "waiting-bets";
       this.dealerCards = [];
       this.activeSeatIndex = null;
       this.activeHandIndex = null;
-    }
-  }
 
-
-
-  // ---- betting + round lifecycle ----
-
-      private handlePlaceBet(msg: ClientToServerMessage) {
-    if (this.phase !== "waiting-bets" && this.phase !== "round-complete") {
+      // Old hands are no longer relevant for the new round
+      for (const seat of this.seats) {
+        seat.hands = [];
+      }
+    } else if (this.phase !== "waiting-bets") {
       this.sendError(msg.playerId, "Cannot bet right now");
       return;
     }
@@ -265,15 +277,12 @@ private handleSeatMessage(msg: ClientToServerMessage) {
       return;
     }
 
-    // 🔥 NEW LOGIC:
     // If this seat already has a pre-deal hand with a bet, ADD to that bet.
-    // Otherwise, create a fresh hand.
     const existingHand = seat.hands.find(
       (h) => h.bet > 0 && h.cards.length === 0
     );
 
     if (existingHand) {
-      // stack onto existing bet
       seat.bankroll -= amount;
       existingHand.bet += amount;
     } else {
@@ -293,63 +302,15 @@ private handleSeatMessage(msg: ClientToServerMessage) {
       ];
     }
 
-    // phase stays waiting-bets; dealing kicks in once at least one bet exists
-    this.phase = "waiting-bets";
-    this.maybeStartRound();
+    // If this is the first bet for this round, start the bet window.
+    if (!this.betDeadline) {
+      this.openBetWindow();
+    }
+
     this.broadcastState();
   }
 
-
-private openBetWindow() {
-  // clear any previous timer just in case
-  if (this.betTimer) {
-    clearTimeout(this.betTimer);
-    this.betTimer = null;
-  }
-
-  this.phase = "waiting-bets";
-  this.betDeadline = Date.now() + BlackjackRoomManager.BET_WINDOW_MS;
-
-  // broadcast so clients can show countdown
-  this.broadcastState();
-
-  this.betTimer = setTimeout(() => {
-    this.betTimer = null;
-    const deadline = this.betDeadline;
-    this.betDeadline = null;
-
-    // Check if any seat actually has a bet
-    const anyBet = this.seats.some((s) =>
-      s.hands.some((h) => h.bet > 0)
-    );
-
-    if (!anyBet) {
-      // No bets placed -> stay in waiting-bets, dealer has no cards
-      this.phase = "waiting-bets";
-      this.dealerCards = [];
-      this.broadcastState();
-      return;
-    }
-
-    // At least one bet -> deal round to ALL seats with bets
-    this.startRound();
-  }, BlackjackRoomManager.BET_WINDOW_MS);
-}
-
-
-
-  private maybeStartRound() {
-    if (this.phase !== "waiting-bets") return;
-
-    const anyBet = this.seats.some((s) =>
-      s.hands.some((h) => h.bet > 0 && h.cards.length === 0)
-    );
-    if (!anyBet) return;
-
-    this.startRound();
-  }
-
-    private startRound() {
+  private startRound() {
     console.log("[BJ server] startRound called, round", this.roundId + 1);
 
     this.roundId += 1;
@@ -378,12 +339,13 @@ private openBetWindow() {
 
     console.log("[BJ server] startRound dealt hands:", handsDealt);
 
-    // find first active hand
+    this.betDeadline = null;
+
+    // find first active hand (0..N, rightmost->leftmost in your mapping)
     this.phase = "player-action";
     this.setNextActiveHand();
     this.broadcastState();
   }
-
 
   private setNextActiveHand() {
     for (let si = 0; si < this.seats.length; si++) {
@@ -409,9 +371,6 @@ private openBetWindow() {
     this.startDealerTurn();
   }
 
-    private roundCompleteTimeout: NodeJS.Timeout | null = null;
-
-
   // ---- player actions ----
 
   private handleAction(msg: ClientToServerMessage) {
@@ -426,13 +385,12 @@ private openBetWindow() {
 
     if (!action) return;
 
-        if (action === "next-round") {
+    if (action === "next-round") {
       if (this.phase !== "round-complete") return;
       this.clearRoundCompleteTimeout();
       this.prepareNextRound();
       return;
     }
-
 
     if (this.phase !== "player-action") {
       this.sendError(msg.playerId, "Not your turn");
@@ -457,40 +415,37 @@ private openBetWindow() {
       return;
     }
 
-    // If this is our demo-only reload action, handle it early and bail.
-// (no need to look up a specific hand)
-if (action === "reload-demo") {
-  const TARGET_BANKROLL = 5000;
+    // Demo-only reload: top up bankroll outside the flow.
+    if (action === "reload-demo") {
+      const TARGET_BANKROLL = 5000;
 
-  if (seat.bankroll < TARGET_BANKROLL) {
-    seat.bankroll = TARGET_BANKROLL;
-  }
+      if (seat.bankroll < TARGET_BANKROLL) {
+        seat.bankroll = TARGET_BANKROLL;
+      }
 
-  this.broadcastState();
-  return;
-}
+      this.broadcastState();
+      return;
+    }
 
-// For all *normal* actions we still require an active hand
-const hand = seat.hands[this.activeHandIndex];
-if (!hand) return;
+    const hand = seat.hands[this.activeHandIndex];
+    if (!hand) return;
 
-switch (action) {
-  case "hit":
-    this.handleHit(hand);
-    break;
-  case "stand":
-    this.handleStand(hand);
-    break;
-  case "double":
-    this.handleDouble(seat, hand);
-    break;
-  case "split":
-    this.handleSplit(seat, hand);
-    break;
-}
+    switch (action) {
+      case "hit":
+        this.handleHit(hand);
+        break;
+      case "stand":
+        this.handleStand(hand);
+        break;
+      case "double":
+        this.handleDouble(seat, hand);
+        break;
+      case "split":
+        this.handleSplit(seat, hand);
+        break;
+    }
 
-this.broadcastState();
-
+    this.broadcastState();
   }
 
   private handleHit(hand: InternalHand) {
@@ -515,7 +470,6 @@ this.broadcastState();
     seat.bankroll -= hand.bet;
     hand.bet *= 2;
 
-    // one card only then stand
     hand.cards.push(this.drawCard());
     const { total } = handValue(hand.cards);
     if (total > 21) {
@@ -539,7 +493,6 @@ this.broadcastState();
 
     seat.bankroll -= hand.bet;
 
-    // create second hand
     const newHand: InternalHand = {
       handIndex: 1,
       cards: [c2, this.drawCard()],
@@ -551,7 +504,6 @@ this.broadcastState();
       payout: 0,
     };
 
-    // mutate original
     hand.cards = [c1, this.drawCard()];
     hand.isBusted = false;
     hand.isStanding = false;
@@ -560,8 +512,6 @@ this.broadcastState();
     hand.payout = 0;
 
     seat.hands = [hand, newHand];
-
-    // keep active hand on the first one after split
     this.activeHandIndex = 0;
   }
 
@@ -570,7 +520,6 @@ this.broadcastState();
   private startDealerTurn() {
     this.phase = "dealer-turn";
 
-    // reveal hole card and play out dealer hand
     let { total, soft } = handValue(this.dealerCards);
     while (total < 17 || (total === 17 && soft === true)) {
       this.dealerCards.push(this.drawCard());
@@ -608,7 +557,7 @@ this.broadcastState();
           payout = -hand.bet;
         } else if (bj && !dealerBJ) {
           result = "blackjack";
-          payout = Math.floor(hand.bet * 3 / 2); // net 1.5x
+          payout = Math.floor((hand.bet * 3) / 2); // net 1.5x
         } else if (dealerBust) {
           result = "win";
           payout = hand.bet;
@@ -631,12 +580,12 @@ this.broadcastState();
         hand.isBlackjack = bj;
         hand.isBusted = bust;
 
-        seat.bankroll += hand.bet + payout; // return stake + net win (or just stake if push)
+        seat.bankroll += hand.bet + payout; // stake + net win (or just stake if push)
       }
     }
   }
 
-    private clearRoundCompleteTimeout() {
+  private clearRoundCompleteTimeout() {
     if (this.roundCompleteTimeout) {
       clearTimeout(this.roundCompleteTimeout);
       this.roundCompleteTimeout = null;
@@ -644,7 +593,6 @@ this.broadcastState();
   }
 
   private scheduleAutoNextRound() {
-    // Clear any existing timer first
     this.clearRoundCompleteTimeout();
 
     this.roundCompleteTimeout = setTimeout(() => {
@@ -652,33 +600,27 @@ this.broadcastState();
         `[BlackjackRoomManager] Auto-prepare next round in room ${this.roomId}`
       );
       this.prepareNextRound();
-    }, 15000); // 15 seconds – tweak to taste
+    }, 15_000);
   }
 
+  private prepareNextRound() {
+    this.phase = "waiting-bets";
+    this.dealerCards = [];
+    this.activeSeatIndex = null;
+    this.activeHandIndex = null;
 
-    private prepareNextRound() {
-  this.phase = "waiting-bets";
-  this.dealerCards = [];
-  this.activeSeatIndex = null;
-  this.activeHandIndex = null;
+    if (this.betTimer) {
+      clearTimeout(this.betTimer);
+      this.betTimer = null;
+    }
+    this.betDeadline = null;
 
-  // 👇 reset betting window
-  if (this.betTimer) {
-    clearTimeout(this.betTimer);
-    this.betTimer = null;
+    for (const seat of this.seats) {
+      seat.hands = [];
+    }
+
+    this.broadcastState();
   }
-  this.betDeadline = null;
-
-  for (const seat of this.seats) {
-    seat.hands = [];
-  }
-
-  this.broadcastState();
-}
-
-
-
-  
 
   // ---- broadcast / views ----
 
@@ -694,37 +636,37 @@ this.broadcastState();
       })),
     }));
 
-    const hideHoleCard = this.phase === "player-action" || this.phase === "dealing";
+    const hideHoleCard =
+      this.phase === "player-action" || this.phase === "dealing";
 
     const dealerViewCards = hideHoleCard
       ? this.dealerCards.map((c, i) => (i === 1 ? "XX" : c))
       : this.dealerCards;
 
     return {
-  roundId: this.roundId,
-  phase: this.phase,
-  minBet: MIN_BET,
-  maxBet: MAX_BET,
-  activeSeatIndex: this.activeSeatIndex,
-  activeHandIndex: this.activeHandIndex,
-  dealer: {
-    cards: dealerViewCards,
-    hideHoleCard,
-  },
-  seats,
-  betDeadlineMs: this.betDeadline, // 👈 expose deadline to clients
-};
-
+      roundId: this.roundId,
+      phase: this.phase,
+      minBet: MIN_BET,
+      maxBet: MAX_BET,
+      activeSeatIndex: this.activeSeatIndex,
+      activeHandIndex: this.activeHandIndex,
+      dealer: {
+        cards: dealerViewCards,
+        hideHoleCard,
+      },
+      seats,
+      betDeadlineMs: this.betDeadline,
+    };
   }
 
-      private broadcastState() {
+  private broadcastState() {
     const table = this.buildView();
 
     const payload: ServerToClientMessage = {
       kind: "blackjack",
       roomId: this.roomId,
       playerId: "server",
-      type: "table-state", // 👈 simpler & matches the hook
+      type: "table-state",
       table,
     };
 
@@ -752,9 +694,7 @@ this.broadcastState();
     }
   }
 
-
-
-    private sendError(playerId: string, message: string) {
+  private sendError(playerId: string, message: string) {
     const client = this.clients.get(playerId);
     if (!client) return;
 
@@ -770,5 +710,4 @@ this.broadcastState();
       client.socket.send(JSON.stringify(payload));
     }
   }
-
 }
