@@ -321,21 +321,30 @@ export class BlackjackRoomManager {
     this.dealerCards.push(this.drawCard()); // up
     this.dealerCards.push(this.drawCard()); // hole
 
-    // deal two cards to each hand with a bet
+        // deal two cards to each hand with a bet
     let handsDealt = 0;
     for (const seat of this.seats) {
       for (const hand of seat.hands) {
         if (hand.bet > 0) {
           hand.cards = [this.drawCard(), this.drawCard()];
           hand.isBusted = false;
-          hand.isStanding = false;
           hand.isBlackjack = isBlackjack(hand.cards);
-          hand.result = "pending";
           hand.payout = 0;
+
+          if (hand.isBlackjack) {
+            // Auto-mark as finished: no actions needed, shows banner immediately
+            hand.result = "blackjack";
+            hand.isStanding = true;
+          } else {
+            hand.result = "pending";
+            hand.isStanding = false;
+          }
+
           handsDealt++;
         }
       }
     }
+
 
     console.log("[BJ server] startRound dealt hands:", handsDealt);
 
