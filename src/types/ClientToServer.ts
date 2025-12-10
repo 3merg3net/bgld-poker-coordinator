@@ -6,4 +6,5 @@ export type ClientToServerMessage = MessageBase & {
   type: string;
   // extra payload fields
   [key: string]: any;
+  
 };

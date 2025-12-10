@@ -394,35 +394,68 @@ export class PokerRoomManager {
       });
     }
 
-    // If hand ended, compute and broadcast showdown + track fake rake
-    if (betting.street === "done") {
-      // Fake rake: 5% of final pot
-      const fakeRake = Math.floor((betting.pot * 5) / 100);
-      this.totalFakeRake += fakeRake;
+      // If hand ended, compute and broadcast showdown + track fake rake
+  if (betting.street === "done") {
+    // Fake rake: 5% of final pot
+    const fakeRake = Math.floor((betting.pot * 5) / 100);
+    this.totalFakeRake += fakeRake;
 
-      console.log(
-        `[PokerRoom:${this.roomId}] Hand #${betting.handId} complete. Pot=${betting.pot}, ` +
-          `Fake rake (5%)=${fakeRake}, Total fake rake=${this.totalFakeRake}`
-      );
+    console.log(
+      `[PokerRoom:${this.roomId}] Hand #${betting.handId} complete. Pot=${betting.pot}, ` +
+        `Fake rake (5%)=${fakeRake}, Total fake rake=${this.totalFakeRake}`
+    );
 
-      const showdown = this.game.computeShowdown();
-      if (showdown) {
-        // ⬇️ No enrichment here – just pass through.
-        // Front-end will only see what computeShowdown() returns.
-        this.broadcast({
-          kind: "poker",
-          roomId: this.roomId,
-          playerId: "server",
-          type: "showdown",
-          handId: showdown.handId,
-          board: showdown.board,
-          players: showdown.players as any,
-        });
+    const showdown = this.game.computeShowdown();
+    if (showdown) {
+      // Broadcast showdown as-is
+      this.broadcast({
+        kind: "poker",
+        roomId: this.roomId,
+        playerId: "server",
+        type: "showdown",
+        handId: showdown.handId,
+        board: showdown.board,
+        players: showdown.players as any,
+      });
+    }
+
+    // 🔥 NEW: sync seat chip stacks from final game state
+    const finalTable = this.game.getLastState();
+    if (finalTable && Array.isArray(finalTable.players)) {
+      // Build a seatIndex -> stack map from the game
+      const stacksBySeat: Record<number, number> = {};
+      for (const p of finalTable.players as any[]) {
+        const seatIdx = p.seatIndex;
+        const stack = typeof p.stack === "number" ? p.stack : 0;
+        if (typeof seatIdx === "number") {
+          stacksBySeat[seatIdx] = stack;
+        }
       }
 
-      // Hand is over; allow new players to sit and new hand to start
-      this.handInProgress = false;
+      // Update this.seats with those stacks so next hand uses correct chip counts
+      this.seats = this.seats.map((s) => {
+        if (!s.playerId) return s;
+        const newStack = stacksBySeat[s.seatIndex];
+        if (typeof newStack === "number") {
+          return { ...s, chips: newStack };
+        }
+        return s;
+      });
+
+      // Let clients know seat chip counts updated
+      this.broadcast({
+        kind: "poker",
+        roomId: this.roomId,
+        playerId: "server",
+        type: "seats-update",
+        seats: this.seats,
+      });
     }
+
+    // Hand is over; allow new players to sit and new hand to start
+    this.handInProgress = false;
+  }
+
   }
 
   /**
