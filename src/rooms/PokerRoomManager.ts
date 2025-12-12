@@ -270,61 +270,67 @@ export class PokerRoomManager {
 
   // ───────────────── HAND LIFECYCLE ─────────────────
 
-  private handleStartHand(requesterId: string) {
+   /**
+   * Central helper: safely attempt to start a new hand.
+   * Returns true if a hand was started, false otherwise.
+   */
+  private tryStartHand(auto: boolean, requesterId?: string): boolean {
     // Re-sync handInProgress with actual betting state
     const currentBetting = this.game.getBettingState();
     if (!currentBetting || currentBetting.street === "done") {
       this.handInProgress = false;
     }
 
-    // Prevent spamming new hands while one is really running
+    // Prevent double-starting if a real hand is already running
     if (this.handInProgress) {
-      this.sendTo(requesterId, {
-        kind: "poker",
-        roomId: this.roomId,
-        playerId: requesterId,
-        type: "error",
-        message: "A hand is already in progress.",
-      });
-      return;
+      if (!auto && requesterId) {
+        this.sendTo(requesterId, {
+          kind: "poker",
+          roomId: this.roomId,
+          playerId: requesterId,
+          type: "error",
+          message: "A hand is already in progress.",
+        });
+      }
+      return false;
     }
 
     // Clear any ghost seats before we look at active players
     this.cleanupGhostSeats();
 
-    // Require at least 2 active players with chips
-    const activeSeats = this.seats.filter(
-      (s) => s.playerId && (s.chips ?? 0) > 0
-    );
-    if (activeSeats.length < 2) {
-      this.sendTo(requesterId, {
-        kind: "poker",
-        roomId: this.roomId,
-        playerId: requesterId,
-        type: "error",
-        message:
-          "At least 2 seated players with chips are required to start a hand.",
-      });
-      return;
+    // ✅ Require at least 2 seated players (ignore chip count here)
+    const seatedPlayers = this.seats.filter((s) => s.playerId);
+    if (seatedPlayers.length < 2) {
+      if (!auto && requesterId) {
+        this.sendTo(requesterId, {
+          kind: "poker",
+          roomId: this.roomId,
+          playerId: requesterId,
+          type: "error",
+          message: "At least 2 seated players are required to start a hand.",
+        });
+      }
+      return false;
     }
 
     const table = this.game.startHand(this.seats);
-
     if (!table) {
-      this.sendTo(requesterId, {
-        kind: "poker",
-        roomId: this.roomId,
-        playerId: requesterId,
-        type: "error",
-        message: "No seated players to start a hand",
-      });
-      return;
+      if (!auto && requesterId) {
+        this.sendTo(requesterId, {
+          kind: "poker",
+          roomId: this.roomId,
+          playerId: requesterId,
+          type: "error",
+          message: "No seated players to start a hand",
+        });
+      }
+      return false;
     }
 
     // Mark a hand as running
     this.handInProgress = true;
 
-    // Broadcast table + betting
+    // Broadcast table + betting for the new hand
     this.broadcast({
       kind: "poker",
       roomId: this.roomId,
@@ -353,6 +359,14 @@ export class PokerRoomManager {
         players: betting.players,
       });
     }
+
+    return true;
+  }
+
+
+  private handleStartHand(requesterId: string) {
+    // CHANGED: delegate to the helper
+    this.tryStartHand(false, requesterId);
   }
 
   private handleAction(
@@ -394,6 +408,7 @@ export class PokerRoomManager {
       });
     }
 
+    // If hand ended, compute and broadcast showdown + track fake rake
       // If hand ended, compute and broadcast showdown + track fake rake
   if (betting.street === "done") {
     // Fake rake: 5% of final pot
@@ -419,41 +434,70 @@ export class PokerRoomManager {
       });
     }
 
-    // 🔥 NEW: sync seat chip stacks from final game state
+    // 🔄 Sync seat chip stacks from final game state
     const finalTable = this.game.getLastState();
     if (finalTable && Array.isArray(finalTable.players)) {
-      // Build a seatIndex -> stack map from the game
-      const stacksBySeat: Record<number, number> = {};
-      for (const p of finalTable.players as any[]) {
-        const seatIdx = p.seatIndex;
-        const stack = typeof p.stack === "number" ? p.stack : 0;
-        if (typeof seatIdx === "number") {
-          stacksBySeat[seatIdx] = stack;
-        }
-      }
+        // 🔄 Sync seat chip stacks from final game state
+  const stacksBySeat: Record<number, number> = {};
+  for (const p of betting.players as any[]) {
+    const seatIdx = p.seatIndex;
+    const stack = typeof p.stack === "number" ? p.stack : 0;
+    if (typeof seatIdx === "number") {
+      stacksBySeat[seatIdx] = stack;
+    }
+  }
 
-      // Update this.seats with those stacks so next hand uses correct chip counts
-      this.seats = this.seats.map((s) => {
-        if (!s.playerId) return s;
-        const newStack = stacksBySeat[s.seatIndex];
-        if (typeof newStack === "number") {
-          return { ...s, chips: newStack };
-        }
-        return s;
-      });
+  this.seats = this.seats.map((s) => {
+    if (!s.playerId) return s;
+    const newStack = stacksBySeat[s.seatIndex];
+    if (typeof newStack === "number") {
+      return { ...s, chips: newStack };
+    }
+    return s;
+  });
 
-      // Let clients know seat chip counts updated
-      this.broadcast({
-        kind: "poker",
-        roomId: this.roomId,
-        playerId: "server",
-        type: "seats-update",
-        seats: this.seats,
-      });
+  this.broadcast({
+    kind: "poker",
+    roomId: this.roomId,
+    playerId: "server",
+    type: "seats-update",
+    seats: this.seats,
+  });
+
     }
 
     // Hand is over; allow new players to sit and new hand to start
     this.handInProgress = false;
+
+        const AUTO_DEAL_DELAY_MS = 30000;
+
+    setTimeout(() => {
+      // If nobody is connected anymore, do nothing
+      if (this.clients.size === 0) return;
+
+      // If a new hand already started, do nothing
+      if (this.handInProgress) return;
+
+      // Clean up ghost seats before counting players
+      this.cleanupGhostSeats();
+
+      // ✅ Only require 2 seated players (stack will be fixed in HoldemGame)
+      const seatedPlayers = this.seats.filter((s) => s.playerId);
+      if (seatedPlayers.length < 2) {
+        console.log(
+          `[PokerRoom:${this.roomId}] Auto-deal skipped; need at least 2 seated players.`
+        );
+        return;
+      }
+
+      console.log(
+        `[PokerRoom:${this.roomId}] Auto-deal: starting new hand after showdown.`
+      );
+
+      // Use helper with auto=true so we don't send user-facing errors
+      this.tryStartHand(true);
+    }, AUTO_DEAL_DELAY_MS);
+;
   }
 
   }

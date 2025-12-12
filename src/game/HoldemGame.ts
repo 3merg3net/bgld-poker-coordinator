@@ -199,7 +199,9 @@ export class HoldemGame {
       const seatSnap = this.seatsSnapshot.find(
         (s) => s.seatIndex === tp.seatIndex
       );
-      const startingStack = seatSnap ? seatSnap.chips : 1000;
+        const startingStack =
+    seatSnap && (seatSnap.chips ?? 0) > 0 ? seatSnap.chips : 1000;
+
       return {
         seatIndex: tp.seatIndex,
         playerId: tp.playerId,
