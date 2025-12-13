@@ -73,6 +73,14 @@ export class BlackjackRoomManager {
   private betDeadline: number | null = null;
   private betTimer: NodeJS.Timeout | null = null;
   private roundCompleteTimeout: NodeJS.Timeout | null = null;
+  // Dealer suspense (server-paced dealer reveal + hits)
+private dealerHoleRevealed = false;
+private dealerStepTimeout: NodeJS.Timeout | null = null;
+
+// Tune these to taste
+private static readonly DEALER_REVEAL_DELAY_MS = 700;
+private static readonly DEALER_HIT_DELAY_MS = 850;
+
 
   private static readonly BET_WINDOW_MS = 15_000; // 15s window
 
@@ -236,6 +244,14 @@ export class BlackjackRoomManager {
     }, BlackjackRoomManager.BET_WINDOW_MS);
   }
 
+  private clearDealerStepTimeout() {
+  if (this.dealerStepTimeout) {
+    clearTimeout(this.dealerStepTimeout);
+    this.dealerStepTimeout = null;
+  }
+}
+
+
   private handlePlaceBet(msg: ClientToServerMessage) {
     // Allow placing bet either:
     // - in waiting-bets, or
@@ -256,6 +272,8 @@ export class BlackjackRoomManager {
       this.sendError(msg.playerId, "Cannot bet right now");
       return;
     }
+
+    
 
     const seatIndex = typeof msg.seatIndex === "number" ? msg.seatIndex : -1;
     const amount = Number(msg.amount ?? 0);
@@ -315,6 +333,9 @@ export class BlackjackRoomManager {
 
     this.roundId += 1;
     this.phase = "dealing";
+    this.clearDealerStepTimeout();
+this.dealerHoleRevealed = false;
+
     this.dealerCards = [];
 
     // initial dealer cards: one up, one down
@@ -398,6 +419,8 @@ export class BlackjackRoomManager {
       if (this.phase !== "round-complete") return;
       this.clearRoundCompleteTimeout();
       this.prepareNextRound();
+      this.clearDealerStepTimeout();
+
       return;
     }
 
@@ -527,21 +550,60 @@ export class BlackjackRoomManager {
   // ---- dealer + settlement ----
 
   private startDealerTurn() {
-    this.phase = "dealer-turn";
+  this.phase = "dealer-turn";
 
-    let { total, soft } = handValue(this.dealerCards);
-    while (total < 17 || (total === 17 && soft === true)) {
-      this.dealerCards.push(this.drawCard());
-      const res = handValue(this.dealerCards);
-      total = res.total;
-      soft = res.soft;
-    }
+  // stop any previous dealer pacing just in case
+  this.clearDealerStepTimeout();
 
+  // hide hole card initially for suspense
+  this.dealerHoleRevealed = false;
+
+  // Broadcast dealer-turn with hole hidden
+  this.broadcastState();
+
+  // 1) Reveal hole card after a short beat
+  this.dealerStepTimeout = setTimeout(() => {
+    this.dealerHoleRevealed = true;
+    this.broadcastState();
+
+    // 2) Then draw dealer hits one-by-one with delay
+    this.stepDealerDraw();
+  }, BlackjackRoomManager.DEALER_REVEAL_DELAY_MS);
+}
+
+private stepDealerDraw() {
+  // safety: if round got reset mid-animation, stop
+  if (this.phase !== "dealer-turn") return;
+
+  // Ensure hole is revealed once dealer starts acting
+  if (!this.dealerHoleRevealed) {
+    this.dealerHoleRevealed = true;
+    this.broadcastState();
+  }
+
+  let { total, soft } = handValue(this.dealerCards);
+
+  const shouldHit =
+    total < 17 || (total === 17 && soft === true); // your current H17 rule
+
+  if (!shouldHit) {
+    // 3) done drawing -> settle + round complete
     this.settleHands();
     this.phase = "round-complete";
     this.broadcastState();
     this.scheduleAutoNextRound();
+    return;
   }
+
+  // Draw exactly ONE card, broadcast, then schedule next step
+  this.dealerCards.push(this.drawCard());
+  this.broadcastState();
+
+  this.dealerStepTimeout = setTimeout(() => {
+    this.stepDealerDraw();
+  }, BlackjackRoomManager.DEALER_HIT_DELAY_MS);
+}
+
 
   private settleHands() {
     const dealerVal = handValue(this.dealerCards);
@@ -617,6 +679,9 @@ export class BlackjackRoomManager {
     this.dealerCards = [];
     this.activeSeatIndex = null;
     this.activeHandIndex = null;
+    this.clearDealerStepTimeout();
+this.dealerHoleRevealed = false;
+
 
     if (this.betTimer) {
       clearTimeout(this.betTimer);
@@ -646,7 +711,10 @@ export class BlackjackRoomManager {
     }));
 
     const hideHoleCard =
-      this.phase === "player-action" || this.phase === "dealing";
+  this.phase === "player-action" ||
+  this.phase === "dealing" ||
+  (this.phase === "dealer-turn" && !this.dealerHoleRevealed);
+
 
     const dealerViewCards = hideHoleCard
       ? this.dealerCards.map((c, i) => (i === 1 ? "XX" : c))
