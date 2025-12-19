@@ -145,9 +145,8 @@ export class HoldemGame {
   startHand(seats: SeatView[]): TableState | null {
     // active seats: anyone with a playerId and chips > 0
     const activeSeats = seats.filter((s) => !!s.playerId && (s.chips ?? 0) > 0);
-    if (activeSeats.length < 1) {
-      return null;
-    }
+if (activeSeats.length < 2) return null;
+
 
     // Snapshot seats for this hand
     this.seatsSnapshot = seats.map((s) => ({ ...s }));
@@ -199,8 +198,8 @@ export class HoldemGame {
       const seatSnap = this.seatsSnapshot.find(
         (s) => s.seatIndex === tp.seatIndex
       );
-        const startingStack =
-    seatSnap && (seatSnap.chips ?? 0) > 0 ? seatSnap.chips : 1000;
+        const startingStack = seatSnap?.chips ?? 0;
+
 
       return {
         seatIndex: tp.seatIndex,

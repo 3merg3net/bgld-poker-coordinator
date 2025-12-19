@@ -2,10 +2,53 @@
 import type { MessageBase } from "./shared";
 import type { Card } from "../game/cards";
 
+/**
+ * Server → Client
+ *
+ * Like ClientToServer, this stays as a generic envelope shared across games.
+ * We add optional type maps for better DX without breaking anything.
+ */
+
+export type ServerToClientType =
+  // shared / generic
+  | "pong"
+  | "error"
+  | "chat-broadcast"
+  | "room-joined"
+  | "room-left"
+  // poker
+  | "seats-update"
+  | "table-state"
+  | "betting-state"
+  | "showdown"
+  | "player-show-cards"
+  | "game-status"
+  // blackjack examples (not exhaustive)
+  | "blackjack-state"
+  | "blackjack-seats"
+  | string;
+
+/** Optional per-type payload typing (non-breaking). */
+export type ServerToClientPayloadMap = {
+  pong: { payload?: string };
+  error: { message: string };
+  "chat-broadcast": { text: string };
+
+  // Poker (high-level; game files can define richer types if needed)
+  "game-status": { started: boolean; handInProgress: boolean };
+};
+export type PokerPlayerShowCards = MessageBase & {
+  kind: "poker";
+  type: "player-show-cards";
+  roomId: string;
+  playerId: string;
+  cards: string[];
+  reason?: "all-in" | "voluntary";
+};
+
 
 export type ServerToClientMessage = MessageBase & {
-  // e.g. "table-state", "chat", "blackjack-state"…
-  type: string;
+  type: ServerToClientType;
   [key: string]: any;
 };
 
@@ -22,7 +65,7 @@ export type BlackjackPhase =
   | "round-complete";
 
 export type BlackjackCard = Card;
- // same "As", "Td" style as cards.ts
+// same "As", "Td" style as cards.ts
 
 export type BlackjackHandResult =
   | "pending"
@@ -57,7 +100,6 @@ export type BlackjackDealerState = {
   hideHoleCard: boolean;
 };
 
-
 export type BlackjackTableState = {
   roundId: number;
   phase: BlackjackPhase;
@@ -68,7 +110,6 @@ export type BlackjackTableState = {
   dealer: BlackjackDealerState;
   seats: BlackjackSeatState[];
 
-  // 👇 NEW: optional betting deadline for countdown UI
+  // optional betting deadline for countdown UI
   betDeadlineMs?: number | null;
 };
-

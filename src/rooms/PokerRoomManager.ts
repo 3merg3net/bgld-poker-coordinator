@@ -16,16 +16,81 @@ export class PokerRoomManager {
   private seats: SeatView[] = [];
   private game: HoldemGame = new HoldemGame();
 
-  // Track if a hand is currently running
   private handInProgress = false;
-
-  // Track lifetime fake rake (just for logging / dev)
   private totalFakeRake = 0;
+// host = lowest occupied seatIndex
+
+
+private getHostSeatIndex(): number | null {
+  let min: number | null = null;
+  for (const s of this.seats) {
+    if (!s.playerId) continue;
+    if (min === null || s.seatIndex < min) min = s.seatIndex;
+  }
+  return min;
+}
+
+  private isHost(playerId: string): boolean {
+  const hostSeat = this.getHostSeatIndex();
+  if (hostSeat === null) return false;
+  const hero = this.seats.find((s) => s.playerId === playerId);
+  return !!hero && hero.seatIndex === hostSeat;
+}
+
+
+
+  // ✅ Server-owned auto-deal timer
+  private autoDealTimer: NodeJS.Timeout | null = null;
+
+  // ✅ Track who we've revealed this hand (all-in + voluntary show)
+  private revealedThisHand: Set<string> = new Set(); // key = `${handId}:${playerId}`
+
+  // ✅ Change to 10s as requested
+  private static readonly AUTO_DEAL_DELAY_MS = 10_000;
+
+  private handleResetTable(requesterId: string) {
+  // host = lowest occupied seatIndex (same as your FE host rule)
+  const occupied = this.seats.filter(s => s.playerId);
+  const hostSeat = occupied.map(s => s.seatIndex).sort((a,b)=>a-b)[0];
+  const requesterSeat = this.seats.find(s => s.playerId === requesterId)?.seatIndex;
+
+  if (hostSeat == null || requesterSeat !== hostSeat) {
+    this.sendTo(requesterId, {
+      kind: "poker",
+      roomId: this.roomId,
+      playerId: requesterId,
+      type: "error",
+      message: "Only the host can reset the table.",
+    });
+    return;
+  }
+
+  // keep seats as-is, just kill the current hand state
+  this.game = new HoldemGame();
+  this.handInProgress = false;
+
+  // broadcast “table cleared”
+  this.broadcast({
+    kind: "poker",
+    roomId: this.roomId,
+    playerId: "server",
+    type: "table-reset",
+  });
+
+  // also re-broadcast seats so everyone is synced
+  this.broadcast({
+    kind: "poker",
+    roomId: this.roomId,
+    playerId: "server",
+    type: "seats-update",
+    seats: this.seats,
+  });
+}
+
 
   constructor(roomId: string) {
     this.roomId = roomId;
 
-    // 9-max layout – front-end dynamically places seated players in a ring
     for (let i = 0; i < 9; i++) {
       this.seats.push({
         seatIndex: i,
@@ -37,13 +102,8 @@ export class PokerRoomManager {
   }
 
   addClient(playerId: string, socket: WebSocket, name?: string) {
-    this.clients.set(playerId, {
-      socket,
-      playerId,
-      name,
-    });
+    this.clients.set(playerId, { socket, playerId, name });
 
-    // Clear out any seats that belong to players who are no longer connected
     this.cleanupGhostSeats();
 
     this.broadcast({
@@ -54,7 +114,6 @@ export class PokerRoomManager {
       onlineCount: this.clients.size,
     });
 
-    // Send seats + current state
     this.sendTo(playerId, {
       kind: "poker",
       roomId: this.roomId,
@@ -92,7 +151,9 @@ export class PokerRoomManager {
         smallBlind: betting.smallBlind,
         maxCommitted: betting.maxCommitted,
         players: betting.players,
-      });
+        smallBlindSeatIndex: (betting as any).smallBlindSeatIndex ?? null,
+        bigBlindSeatIndex: (betting as any).bigBlindSeatIndex ?? null,
+      } as any);
     }
   }
 
@@ -100,7 +161,6 @@ export class PokerRoomManager {
     if (!this.clients.has(playerId)) return;
     this.clients.delete(playerId);
 
-    // Stand them up if seated
     let changed = false;
     this.seats = this.seats.map((s) => {
       if (s.playerId === playerId) {
@@ -127,7 +187,6 @@ export class PokerRoomManager {
       type: "room-left",
     });
 
-    // If no clients remain, hard reset table so no ghost seats/hands remain
     if (this.clients.size === 0) {
       this.resetTableState();
     }
@@ -171,13 +230,16 @@ export class PokerRoomManager {
         this.handleAction(msg.playerId, msg.action, msg.amount);
         break;
 
-      // client asks server to reveal *their* hole cards to everyone
       case "show-cards":
         this.handleShowCards(msg.playerId);
         break;
 
+        case "reset-table":
+  this.handleResetTable(msg.playerId);
+  break;
+
+
       default:
-        // join/leave handled at connection level
         break;
     }
   }
@@ -190,15 +252,9 @@ export class PokerRoomManager {
     seatIndex?: number,
     name?: string
   ) {
-    // ✅ GG-style: allow sitting mid-hand.
-    // New players won't appear in the current betting state,
-    // so they simply wait and are dealt in on the *next* hand.
-
-    // If already seated, ignore
     const already = this.seats.find((s) => s.playerId === playerId);
     if (already) return;
 
-    // Pick seat: specific or first open
     let targetSeat: SeatView | undefined;
 
     if (typeof seatIndex === "number") {
@@ -220,10 +276,8 @@ export class PokerRoomManager {
       return;
     }
 
-    // SANITIZE BUY-IN (fake chips)
     const stack = Math.max(1, Math.floor(buyIn ?? 0));
 
-    // Assign seat
     this.seats = this.seats.map((s) =>
       s.seatIndex === targetSeat!.seatIndex
         ? {
@@ -242,8 +296,6 @@ export class PokerRoomManager {
       type: "seats-update",
       seats: this.seats,
     });
-
-    // Optional: system chat "X sits and will be dealt next hand."
   }
 
   private handleStand(playerId: string) {
@@ -270,10 +322,34 @@ export class PokerRoomManager {
 
   // ───────────────── HAND LIFECYCLE ─────────────────
 
-   /**
-   * Central helper: safely attempt to start a new hand.
-   * Returns true if a hand was started, false otherwise.
-   */
+  private clearAutoDealTimer() {
+  if (this.autoDealTimer) {
+    clearTimeout(this.autoDealTimer);
+    this.autoDealTimer = null;
+  }
+}
+
+ private armAutoDeal() {
+  this.clearAutoDealTimer();
+
+  this.autoDealTimer = setTimeout(() => {
+    if (this.clients.size === 0) return;
+
+    // Try to start. If it fails (ex: players at 0 chips), re-arm and keep polling.
+    const started = this.tryStartHand(true);
+
+    if (!started && this.clients.size > 0) {
+      // Re-arm in a shorter interval so table recovers quickly once someone refills
+      this.clearAutoDealTimer();
+      this.autoDealTimer = setTimeout(() => {
+        if (this.clients.size === 0) return;
+        this.tryStartHand(true);
+      }, 5_000) as any;
+    }
+  }, PokerRoomManager.AUTO_DEAL_DELAY_MS) as any;
+}
+
+
   private tryStartHand(auto: boolean, requesterId?: string): boolean {
     // Re-sync handInProgress with actual betting state
     const currentBetting = this.game.getBettingState();
@@ -281,7 +357,6 @@ export class PokerRoomManager {
       this.handInProgress = false;
     }
 
-    // Prevent double-starting if a real hand is already running
     if (this.handInProgress) {
       if (!auto && requesterId) {
         this.sendTo(requesterId, {
@@ -295,12 +370,10 @@ export class PokerRoomManager {
       return false;
     }
 
-    // Clear any ghost seats before we look at active players
     this.cleanupGhostSeats();
 
-    // ✅ Require at least 2 seated players (ignore chip count here)
-    const seatedPlayers = this.seats.filter((s) => s.playerId);
-    if (seatedPlayers.length < 2) {
+    const seatedPlayers = this.seats.filter((s) => s.playerId && (s.chips ?? 0) > 0);
+if (seatedPlayers.length < 2) {
       if (!auto && requesterId) {
         this.sendTo(requesterId, {
           kind: "poker",
@@ -312,6 +385,9 @@ export class PokerRoomManager {
       }
       return false;
     }
+
+    // ✅ Starting a new hand cancels any pending auto-deal
+    this.clearAutoDealTimer();
 
     const table = this.game.startHand(this.seats);
     if (!table) {
@@ -327,10 +403,11 @@ export class PokerRoomManager {
       return false;
     }
 
-    // Mark a hand as running
     this.handInProgress = true;
 
-    // Broadcast table + betting for the new hand
+    // ✅ New hand: reset reveal tracking
+    this.revealedThisHand.clear();
+
     this.broadcast({
       kind: "poker",
       roomId: this.roomId,
@@ -357,16 +434,49 @@ export class PokerRoomManager {
         smallBlind: betting.smallBlind,
         maxCommitted: betting.maxCommitted,
         players: betting.players,
-      });
+        smallBlindSeatIndex: (betting as any).smallBlindSeatIndex ?? null,
+        bigBlindSeatIndex: (betting as any).bigBlindSeatIndex ?? null,
+      } as any);
     }
 
     return true;
   }
 
-
   private handleStartHand(requesterId: string) {
-    // CHANGED: delegate to the helper
     this.tryStartHand(false, requesterId);
+  }
+
+  private maybeRevealAllInHands() {
+    const betting = this.game.getBettingState();
+    if (!betting || betting.street === "done") return;
+
+    for (const p of betting.players as any[]) {
+      if (!p?.playerId) continue;
+      if (!p.inHand || p.hasFolded) continue;
+
+      // ✅ "All-in" condition
+      if (typeof p.stack === "number" && p.stack === 0) {
+        const key = `${betting.handId}:${p.playerId}`;
+        if (this.revealedThisHand.has(key)) continue;
+
+        const anyGame: any = this.game as any;
+        if (typeof anyGame.getHoleCardsForPlayer !== "function") continue;
+
+        const hole = anyGame.getHoleCardsForPlayer(p.playerId) as string[] | null;
+        if (!hole || hole.length !== 2) continue;
+
+        this.revealedThisHand.add(key);
+
+        this.broadcast({
+          kind: "poker",
+          roomId: this.roomId,
+          playerId: p.playerId,
+          type: "player-show-cards",
+          cards: hole,
+          reason: "all-in",
+        } as any);
+      }
+    }
   }
 
   private handleAction(
@@ -377,7 +487,6 @@ export class PokerRoomManager {
     const betting = this.game.applyAction(playerId, action, amount);
     if (!betting) return;
 
-    // Always broadcast updated betting state
     this.broadcast({
       kind: "poker",
       roomId: this.roomId,
@@ -392,9 +501,10 @@ export class PokerRoomManager {
       smallBlind: betting.smallBlind,
       maxCommitted: betting.maxCommitted,
       players: betting.players,
-    });
+      smallBlindSeatIndex: (betting as any).smallBlindSeatIndex ?? null,
+      bigBlindSeatIndex: (betting as any).bigBlindSeatIndex ?? null,
+    } as any);
 
-    // Also broadcast updated table state (board might have changed)
     const table = this.game.getLastState();
     if (table) {
       this.broadcast({
@@ -408,136 +518,119 @@ export class PokerRoomManager {
       });
     }
 
-    // If hand ended, compute and broadcast showdown + track fake rake
-      // If hand ended, compute and broadcast showdown + track fake rake
-  if (betting.street === "done") {
-    // Fake rake: 5% of final pot
-    const fakeRake = Math.floor((betting.pot * 5) / 100);
-    this.totalFakeRake += fakeRake;
+    // ✅ reveal any newly all-in hands immediately
+    this.maybeRevealAllInHands();
 
-    console.log(
-      `[PokerRoom:${this.roomId}] Hand #${betting.handId} complete. Pot=${betting.pot}, ` +
-        `Fake rake (5%)=${fakeRake}, Total fake rake=${this.totalFakeRake}`
-    );
+    if (betting.street === "done") {
+      const fakeRake = Math.floor((betting.pot * 5) / 100);
+      this.totalFakeRake += fakeRake;
 
-    const showdown = this.game.computeShowdown();
-    if (showdown) {
-      // Broadcast showdown as-is
+      console.log(
+        `[PokerRoom:${this.roomId}] Hand #${betting.handId} complete. Pot=${betting.pot}, ` +
+          `Fake rake (5%)=${fakeRake}, Total fake rake=${this.totalFakeRake}`
+      );
+
+      const showdown = this.game.computeShowdown();
+      if (showdown) {
+        this.broadcast({
+          kind: "poker",
+          roomId: this.roomId,
+          playerId: "server",
+          type: "showdown",
+          handId: showdown.handId,
+          board: showdown.board,
+          players: showdown.players as any,
+        });
+      }
+
+      // Sync seat chip stacks from final game state
+      const stacksBySeat: Record<number, number> = {};
+      for (const p of betting.players as any[]) {
+        const seatIdx = p.seatIndex;
+        const stack = typeof p.stack === "number" ? p.stack : 0;
+        if (typeof seatIdx === "number") stacksBySeat[seatIdx] = stack;
+      }
+
+      this.seats = this.seats.map((s) => {
+        if (!s.playerId) return s;
+        const newStack = stacksBySeat[s.seatIndex];
+        if (typeof newStack === "number") return { ...s, chips: newStack };
+        return s;
+      });
+
       this.broadcast({
         kind: "poker",
         roomId: this.roomId,
         playerId: "server",
-        type: "showdown",
-        handId: showdown.handId,
-        board: showdown.board,
-        players: showdown.players as any,
+        type: "seats-update",
+        seats: this.seats,
       });
-    }
 
-    // 🔄 Sync seat chip stacks from final game state
-    const finalTable = this.game.getLastState();
-    if (finalTable && Array.isArray(finalTable.players)) {
-        // 🔄 Sync seat chip stacks from final game state
-  const stacksBySeat: Record<number, number> = {};
-  for (const p of betting.players as any[]) {
-    const seatIdx = p.seatIndex;
-    const stack = typeof p.stack === "number" ? p.stack : 0;
-    if (typeof seatIdx === "number") {
-      stacksBySeat[seatIdx] = stack;
-    }
-  }
+      this.handInProgress = false;
 
-  this.seats = this.seats.map((s) => {
-    if (!s.playerId) return s;
-    const newStack = stacksBySeat[s.seatIndex];
-    if (typeof newStack === "number") {
-      return { ...s, chips: newStack };
-    }
-    return s;
-  });
+      // ✅ Always arm next hand after a finish (server-owned)
+      this.cleanupGhostSeats();
 
+// ✅ only arm if 2+ players are BOTH seated AND have chips
+const eligible = this.seats.filter((s) => s.playerId && (s.chips ?? 0) > 0);
+
+if (eligible.length >= 2 && this.clients.size > 0) {
+  console.log(
+    `[PokerRoom:${this.roomId}] Auto-deal armed: next hand in ${PokerRoomManager.AUTO_DEAL_DELAY_MS}ms`
+  );
+  this.armAutoDeal();
+} else {
+  console.log(
+    `[PokerRoom:${this.roomId}] Auto-deal paused; need 2 seated players with chips (>0) and at least 1 connected.`
+  );
+
+  // Optional: tell table why it stopped (feels less “broken”)
   this.broadcast({
     kind: "poker",
     roomId: this.roomId,
     playerId: "server",
-    type: "seats-update",
-    seats: this.seats,
-  });
+    type: "chat-broadcast",
+    text: "Auto-deal paused: need 2+ seated players with chips. Refill your stack to keep playing.",
+  } as any);
+}
 
     }
-
-    // Hand is over; allow new players to sit and new hand to start
-    this.handInProgress = false;
-
-        const AUTO_DEAL_DELAY_MS = 30000;
-
-    setTimeout(() => {
-      // If nobody is connected anymore, do nothing
-      if (this.clients.size === 0) return;
-
-      // If a new hand already started, do nothing
-      if (this.handInProgress) return;
-
-      // Clean up ghost seats before counting players
-      this.cleanupGhostSeats();
-
-      // ✅ Only require 2 seated players (stack will be fixed in HoldemGame)
-      const seatedPlayers = this.seats.filter((s) => s.playerId);
-      if (seatedPlayers.length < 2) {
-        console.log(
-          `[PokerRoom:${this.roomId}] Auto-deal skipped; need at least 2 seated players.`
-        );
-        return;
-      }
-
-      console.log(
-        `[PokerRoom:${this.roomId}] Auto-deal: starting new hand after showdown.`
-      );
-
-      // Use helper with auto=true so we don't send user-facing errors
-      this.tryStartHand(true);
-    }, AUTO_DEAL_DELAY_MS);
-;
   }
 
-  }
-
-  /**
-   * Player requests to show *their* hole cards to the table.
-   * We only allow this after river (street === "done").
-   */
   private handleShowCards(playerId: string) {
     const betting = this.game.getBettingState();
-    if (!betting || betting.street !== "done") {
-      // Don’t reveal mid-hand
-      return;
-    }
+    if (!betting || betting.street !== "done") return;
 
-    // Optional helper on HoldemGame:
-    // getHoleCardsForPlayer(playerId: string): string[] | null
+    
+// ✅ Hand is over
+this.handInProgress = false;
+
+// ✅ Always arm auto-deal after a completed hand (server-owned)
+this.armAutoDeal();
+
     const anyGame: any = this.game as any;
-    if (typeof anyGame.getHoleCardsForPlayer !== "function") {
-      return;
-    }
+    if (typeof anyGame.getHoleCardsForPlayer !== "function") return;
 
-    const hole = anyGame.getHoleCardsForPlayer(playerId) as
-      | string[]
-      | null
-      | undefined;
+    const hole = anyGame.getHoleCardsForPlayer(playerId) as string[] | null;
     if (!hole || hole.length !== 2) return;
+
+    // ✅ prevent spamming same reveal
+    const key = `${betting.handId}:${playerId}`;
+    if (this.revealedThisHand.has(key)) return;
+    this.revealedThisHand.add(key);
 
     this.broadcast({
       kind: "poker",
       roomId: this.roomId,
       playerId,
       type: "player-show-cards",
-      cards: hole, // e.g. ["Ah", "Kd"]
-    } as ServerToClientMessage);
+      cards: hole,
+      reason: "voluntary",
+    } as any);
   }
 
   // ───────────────── GHOST / RESET HELPERS ─────────────────
 
-  /** Remove seats that reference players who no longer have a live WebSocket */
   private cleanupGhostSeats() {
     const activeIds = new Set(this.clients.keys());
     let changed = false;
@@ -561,8 +654,10 @@ export class PokerRoomManager {
     }
   }
 
-  /** When the last client leaves, fully reset seats + game state. */
   private resetTableState() {
+    this.clearAutoDealTimer();
+    this.revealedThisHand.clear();
+
     const freshSeats: SeatView[] = [];
     for (let i = 0; i < 9; i++) {
       freshSeats.push({
