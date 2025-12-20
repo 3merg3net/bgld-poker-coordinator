@@ -144,8 +144,9 @@ export class HoldemGame {
   // Called by server when a new hand should start
   startHand(seats: SeatView[]): TableState | null {
     // active seats: anyone with a playerId and chips > 0
-    const activeSeats = seats.filter((s) => !!s.playerId && (s.chips ?? 0) > 0);
+    const activeSeats = seats.filter(s => s.playerId && (s.chips ?? 0) > 0);
 if (activeSeats.length < 2) return null;
+
 
 
     // Snapshot seats for this hand
@@ -297,7 +298,7 @@ if (activeSeats.length < 2) return null;
     return this.lastTable;
   }
 
-  // Called for each player action
+    // Called for each player action
   applyAction(
     playerId: string,
     action: "fold" | "check" | "call" | "bet",
@@ -313,25 +314,34 @@ if (activeSeats.length < 2) return null;
     if (!p.inHand || p.hasFolded) return b;
 
     const callNeeded = Math.max(0, b.maxCommitted - p.committed);
+    const isAllIn = p.stack <= 0;
+
+    // If you're all-in, you have no actions. Mark acted and advance.
+    if (isAllIn) {
+      p.stack = Math.max(0, p.stack);
+      p.hasActed = true;
+      this.advanceBetting();
+      return this.betting;
+    }
 
     if (action === "fold") {
       p.hasFolded = true;
       p.inHand = false;
       p.hasActed = true;
     } else if (action === "check") {
-      if (callNeeded > 0 && p.stack > 0) {
-        const callAmt = Math.min(callNeeded, p.stack);
-        p.stack -= callAmt;
-        p.committed += callAmt;
-        p.totalContributed += callAmt;
-        b.pot += callAmt;
-        b.maxCommitted = Math.max(b.maxCommitted, p.committed);
+      // ✅ CHECK must be free; only allowed if you owe nothing.
+      // If UI accidentally sends "check" when it should be "call", we ignore it.
+      if (callNeeded === 0) {
+        p.hasActed = true;
+      } else {
+        // Not allowed: player still owes chips to match.
+        // Do NOT move state forward by marking hasActed.
+        return b;
       }
-      p.hasActed = true;
     } else if (action === "call") {
       const callAmt = Math.min(callNeeded, p.stack);
       if (callAmt > 0) {
-        p.stack -= callAmt;
+        p.stack = Math.max(0, p.stack - callAmt);
         p.committed += callAmt;
         p.totalContributed += callAmt;
         b.pot += callAmt;
@@ -340,26 +350,28 @@ if (activeSeats.length < 2) return null;
       p.hasActed = true;
     } else if (action === "bet") {
       const baseBet =
-        typeof amount === "number" && amount > 0
+        typeof amount === "number" && Number.isFinite(amount) && amount > 0
           ? Math.floor(amount)
           : b.bigBlind * 2;
 
       const desired = callNeeded + baseBet;
       const spend = Math.min(p.stack, desired);
+
       if (spend > 0) {
-        p.stack -= spend;
+        p.stack = Math.max(0, p.stack - spend);
         p.committed += spend;
         p.totalContributed += spend;
         b.pot += spend;
         b.maxCommitted = Math.max(b.maxCommitted, p.committed);
       }
+
       p.hasActed = true;
 
-      // Any new bet/raise means others need to act again
+      // Any new bet/raise means others need to act again (unless they are all-in)
       for (let i = 0; i < b.players.length; i++) {
         if (i === pIdx) continue;
         const other = b.players[i];
-        if (other.inHand && !other.hasFolded) {
+        if (other.inHand && !other.hasFolded && other.stack > 0) {
           other.hasActed = false;
         }
       }
@@ -368,6 +380,7 @@ if (activeSeats.length < 2) return null;
     this.advanceBetting();
     return this.betting;
   }
+
 
   // Called by server when street is done and we need final result
   computeShowdown(): ShowdownState | null {
@@ -561,7 +574,7 @@ if (activeSeats.length < 2) return null;
     return this.deck.pop() as Card;
   }
 
-  private findNextSeatToAct(
+   private findNextSeatToAct(
     players: BettingPlayerState[],
     fromSeatIndex: number,
     wrap: boolean
@@ -572,7 +585,13 @@ if (activeSeats.length < 2) return null;
 
     const idx = seatOrder.indexOf(fromSeatIndex);
     if (idx === -1) {
-      return seatOrder.length > 0 ? seatOrder[0] : null;
+      // start at lowest eligible seat
+      for (const s of seatOrder) {
+        const p = players.find((pl) => pl.seatIndex === s);
+        if (!p) continue;
+        if (p.inHand && !p.hasFolded && p.stack > 0) return p.seatIndex; // ✅ skip all-in
+      }
+      return null;
     }
 
     for (let step = 1; step <= seatOrder.length; step++) {
@@ -580,32 +599,48 @@ if (activeSeats.length < 2) return null;
       const s = seatOrder[nextIdx];
       const p = players.find((pl) => pl.seatIndex === s);
       if (!p) continue;
-      if (p.inHand && !p.hasFolded && p.stack >= 0) {
+
+      // ✅ only seats with decisions left (stack > 0) can be currentSeatIndex
+      if (p.inHand && !p.hasFolded && p.stack > 0) {
         return p.seatIndex;
       }
+
       if (!wrap && nextIdx < idx) break;
     }
 
     return null;
   }
 
+
   private getActingOrder(seatIndices: number[]): number[] {
     return seatIndices.slice().sort((a, b) => a - b);
   }
 
-  private advanceBetting() {
+    private advanceBetting() {
     const b = this.betting;
     const t = this.lastTable;
     if (!b || !t) return;
 
-    // If only one player remains, end hand
-    const activePlayers = b.players.filter(
-      (p) => p.inHand && !p.hasFolded
-    );
+    // If only one player remains, end hand immediately
+    const activePlayers = b.players.filter((p) => p.inHand && !p.hasFolded);
     if (activePlayers.length <= 1) {
       b.street = "done";
       b.currentSeatIndex = null;
       this.betting = b;
+      return;
+    }
+
+    // If everyone remaining is all-in (stack==0), there are no actions left.
+    // ✅ Run board out to the river and end hand (prevents freezes).
+    const anyCanAct = activePlayers.some((p) => p.stack > 0);
+    if (!anyCanAct) {
+      while (t.board.length < 5) {
+        t.board.push(this.drawCard());
+      }
+      b.street = "done";
+      b.currentSeatIndex = null;
+      this.betting = b;
+      this.lastTable = t;
       return;
     }
 
@@ -615,14 +650,13 @@ if (activeSeats.length < 2) return null;
       // Reset committed + acted flags for next street
       for (const p of b.players) {
         p.committed = 0;
-        p.hasActed = false;
+        // only players who can act should be required to act next street
+        p.hasActed = p.stack <= 0; // ✅ all-in players considered "already acted"
       }
       b.maxCommitted = 0;
 
       if (b.street === "preflop") {
-        t.board.push(this.drawCard());
-        t.board.push(this.drawCard());
-        t.board.push(this.drawCard());
+        t.board.push(this.drawCard(), this.drawCard(), this.drawCard());
         b.street = "flop";
       } else if (b.street === "flop") {
         t.board.push(this.drawCard());
@@ -638,23 +672,44 @@ if (activeSeats.length < 2) return null;
         return;
       }
 
-      const nextSeat = this.findNextSeatToAct(
-        b.players,
-        b.buttonSeatIndex,
-        true
-      );
-      b.currentSeatIndex = nextSeat;
+      // Next to act postflop starts left of button (your existing behavior)
+      const nextSeat = this.findNextSeatToAct(b.players, b.buttonSeatIndex, true);
+
+      // If nobody can act on the new street (e.g. all-in after runout), end.
+      if (nextSeat == null) {
+        while (t.board.length < 5) {
+          t.board.push(this.drawCard());
+        }
+        b.street = "done";
+        b.currentSeatIndex = null;
+      } else {
+        b.currentSeatIndex = nextSeat;
+      }
+
       this.betting = b;
       this.lastTable = t;
       return;
     }
 
-    const fromSeat =
-      b.currentSeatIndex != null ? b.currentSeatIndex : b.buttonSeatIndex;
+    const fromSeat = b.currentSeatIndex != null ? b.currentSeatIndex : b.buttonSeatIndex;
     const nextSeat = this.findNextSeatToAct(b.players, fromSeat, true);
+
+    // If no eligible seat can act mid-street, run it out and end.
+    if (nextSeat == null) {
+      while (t.board.length < 5) {
+        t.board.push(this.drawCard());
+      }
+      b.street = "done";
+      b.currentSeatIndex = null;
+      this.betting = b;
+      this.lastTable = t;
+      return;
+    }
+
     b.currentSeatIndex = nextSeat;
     this.betting = b;
   }
+
 
   private isBettingRoundComplete(b: BettingState): boolean {
     const active = b.players.filter((p) => p.inHand && !p.hasFolded);

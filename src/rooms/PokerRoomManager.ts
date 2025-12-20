@@ -37,6 +37,37 @@ private getHostSeatIndex(): number | null {
   return !!hero && hero.seatIndex === hostSeat;
 }
 
+private handleRefillStack(playerId: string, amount?: number) {
+  // only between hands
+  const betting = this.game.getBettingState();
+  if (betting && betting.street !== "done") return;
+
+  const seat = this.seats.find((s) => s.playerId === playerId);
+  if (!seat) return;
+
+  const amt = Math.max(0, Math.floor(Number(amount ?? 0)));
+  if (!Number.isFinite(amt) || amt <= 0) return;
+
+  seat.chips = (seat.chips ?? 0) + amt;
+
+  this.broadcast({
+    kind: "poker",
+    roomId: this.roomId,
+    playerId: "server",
+    type: "seats-update",
+    seats: this.seats,
+  } as any);
+
+  // if table idle + now eligible, re-arm
+  if (!this.handInProgress) {
+    const eligible = this.seats.filter((s) => s.playerId && (s.chips ?? 0) > 0);
+    if (eligible.length >= 2 && this.clients.size > 0) {
+      this.armAutoDeal();
+    }
+  }
+}
+
+
 
 
   // ✅ Server-owned auto-deal timer
@@ -49,12 +80,7 @@ private getHostSeatIndex(): number | null {
   private static readonly AUTO_DEAL_DELAY_MS = 10_000;
 
   private handleResetTable(requesterId: string) {
-  // host = lowest occupied seatIndex (same as your FE host rule)
-  const occupied = this.seats.filter(s => s.playerId);
-  const hostSeat = occupied.map(s => s.seatIndex).sort((a,b)=>a-b)[0];
-  const requesterSeat = this.seats.find(s => s.playerId === requesterId)?.seatIndex;
-
-  if (hostSeat == null || requesterSeat !== hostSeat) {
+  if (!this.isHost(requesterId)) {
     this.sendTo(requesterId, {
       kind: "poker",
       roomId: this.roomId,
@@ -65,27 +91,34 @@ private getHostSeatIndex(): number | null {
     return;
   }
 
-  // keep seats as-is, just kill the current hand state
+  this.clearAutoDealTimer();
+  this.revealedThisHand.clear();
+
   this.game = new HoldemGame();
   this.handInProgress = false;
 
-  // broadcast “table cleared”
   this.broadcast({
     kind: "poker",
     roomId: this.roomId,
     playerId: "server",
     type: "table-reset",
-  });
+  } as any);
 
-  // also re-broadcast seats so everyone is synced
   this.broadcast({
     kind: "poker",
     roomId: this.roomId,
     playerId: "server",
     type: "seats-update",
     seats: this.seats,
-  });
+  } as any);
+
+  // optional: if eligible, arm
+  const eligible = this.seats.filter((s) => s.playerId && (s.chips ?? 0) > 0);
+  if (eligible.length >= 2 && this.clients.size > 0) {
+    this.armAutoDeal();
+  }
 }
+
 
 
   constructor(roomId: string) {
@@ -238,6 +271,11 @@ private getHostSeatIndex(): number | null {
   this.handleResetTable(msg.playerId);
   break;
 
+  case "refill-stack":
+  this.handleRefillStack(msg.playerId, (msg as any).amount);
+  break;
+
+
 
       default:
         break;
@@ -296,6 +334,14 @@ private getHostSeatIndex(): number | null {
       type: "seats-update",
       seats: this.seats,
     });
+        // ✅ If table becomes eligible after a sit, arm auto-deal (server-owned)
+    if (!this.handInProgress) {
+      const eligible = this.seats.filter((s) => s.playerId && (s.chips ?? 0) > 0);
+      if (eligible.length >= 2 && this.clients.size > 0) {
+        this.armAutoDeal();
+      }
+    }
+
   }
 
   private handleStand(playerId: string) {
@@ -439,12 +485,27 @@ if (seatedPlayers.length < 2) {
       } as any);
     }
 
+    this.maybeRevealAllInHands();
+ 
+
     return true;
   }
 
   private handleStartHand(requesterId: string) {
-    this.tryStartHand(false, requesterId);
+  if (!this.isHost(requesterId)) {
+    this.sendTo(requesterId, {
+      kind: "poker",
+      roomId: this.roomId,
+      playerId: requesterId,
+      type: "error",
+      message: "Only the host can start the hand.",
+    } as any);
+    return;
   }
+
+  this.tryStartHand(false, requesterId);
+}
+
 
   private maybeRevealAllInHands() {
     const betting = this.game.getBettingState();
@@ -454,28 +515,7 @@ if (seatedPlayers.length < 2) {
       if (!p?.playerId) continue;
       if (!p.inHand || p.hasFolded) continue;
 
-      // ✅ "All-in" condition
-      if (typeof p.stack === "number" && p.stack === 0) {
-        const key = `${betting.handId}:${p.playerId}`;
-        if (this.revealedThisHand.has(key)) continue;
-
-        const anyGame: any = this.game as any;
-        if (typeof anyGame.getHoleCardsForPlayer !== "function") continue;
-
-        const hole = anyGame.getHoleCardsForPlayer(p.playerId) as string[] | null;
-        if (!hole || hole.length !== 2) continue;
-
-        this.revealedThisHand.add(key);
-
-        this.broadcast({
-          kind: "poker",
-          roomId: this.roomId,
-          playerId: p.playerId,
-          type: "player-show-cards",
-          cards: hole,
-          reason: "all-in",
-        } as any);
-      }
+     
     }
   }
 
@@ -598,36 +638,30 @@ if (eligible.length >= 2 && this.clients.size > 0) {
   }
 
   private handleShowCards(playerId: string) {
-    const betting = this.game.getBettingState();
-    if (!betting || betting.street !== "done") return;
+  const betting = this.game.getBettingState();
+  if (!betting || betting.street !== "done") return;
 
-    
-// ✅ Hand is over
-this.handInProgress = false;
+  const anyGame: any = this.game as any;
+  if (typeof anyGame.getHoleCardsForPlayer !== "function") return;
 
-// ✅ Always arm auto-deal after a completed hand (server-owned)
-this.armAutoDeal();
+  const hole = anyGame.getHoleCardsForPlayer(playerId) as string[] | null;
+  if (!hole || hole.length !== 2) return;
 
-    const anyGame: any = this.game as any;
-    if (typeof anyGame.getHoleCardsForPlayer !== "function") return;
+  // prevent spamming same reveal
+  const key = `${betting.handId}:${playerId}`;
+  if (this.revealedThisHand.has(key)) return;
+  this.revealedThisHand.add(key);
 
-    const hole = anyGame.getHoleCardsForPlayer(playerId) as string[] | null;
-    if (!hole || hole.length !== 2) return;
+  this.broadcast({
+    kind: "poker",
+    roomId: this.roomId,
+    playerId,
+    type: "player-show-cards",
+    cards: hole,
+    reason: "voluntary",
+  } as any);
+}
 
-    // ✅ prevent spamming same reveal
-    const key = `${betting.handId}:${playerId}`;
-    if (this.revealedThisHand.has(key)) return;
-    this.revealedThisHand.add(key);
-
-    this.broadcast({
-      kind: "poker",
-      roomId: this.roomId,
-      playerId,
-      type: "player-show-cards",
-      cards: hole,
-      reason: "voluntary",
-    } as any);
-  }
 
   // ───────────────── GHOST / RESET HELPERS ─────────────────
 
@@ -672,6 +706,7 @@ this.armAutoDeal();
     this.game = new HoldemGame();
     this.handInProgress = false;
     this.totalFakeRake = 0;
+    
 
     console.log(
       `[PokerRoom:${this.roomId}] All clients gone. Resetting table state.`
