@@ -45,6 +45,9 @@ export type ClientToServerPayloadMap = {
   "start-game": Record<string, never>;
   "start-hand": Record<string, never>; // legacy alias
   "refill-stack": { amount: number };
+    
+  "demo-topup": { target?: number };
+
 
   // ── Blackjack (examples; your bj system can keep using any fields it needs)
   "bj-place-bet": { seatIndex?: number; amount: number };

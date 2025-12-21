@@ -34,6 +34,19 @@ export type ServerToClientPayloadMap = {
   error: { message: string };
   "chat-broadcast": { text: string };
 
+    // Poker
+  "seats-update": {
+    seats: Array<{
+      seatIndex: number;
+      playerId: string | null;
+      name?: string;
+      chips?: number;
+    }>;
+    // ✅ server-owned bankroll (off-table). Optional so it’s non-breaking.
+    bankrolls?: Record<string, number>;
+  };
+
+
   // Poker (high-level; game files can define richer types if needed)
   "game-status": { started: boolean; handInProgress: boolean };
 };
