@@ -112,7 +112,7 @@ export class BlackjackRoomManager {
   private static readonly DEALER_REVEAL_DELAY_MS = 700;
   private static readonly DEALER_HIT_DELAY_MS = 850;
 
-  private static readonly BET_WINDOW_MS = 15_000;
+  private static readonly BET_WINDOW_MS = 10_000;
 
   constructor(roomId: string) {
     this.roomId = roomId;
