@@ -5,8 +5,7 @@ import type { Card } from "../game/cards";
 /**
  * Server → Client
  *
- * Like ClientToServer, this stays as a generic envelope shared across games.
- * We add optional type maps for better DX without breaking anything.
+ * Generic envelope shared across games.
  */
 
 export type ServerToClientType =
@@ -16,6 +15,10 @@ export type ServerToClientType =
   | "chat-broadcast"
   | "room-joined"
   | "room-left"
+
+  // ✅ lobby
+  | "rooms-list"
+
   // poker
   | "seats-update"
   | "table-state"
@@ -23,9 +26,15 @@ export type ServerToClientType =
   | "showdown"
   | "player-show-cards"
   | "game-status"
-  // blackjack examples (not exhaustive)
+
+  // blackjack (legacy labels allowed)
   | "blackjack-state"
   | "blackjack-seats"
+
+  // ✅ blackjack lobby ops
+  | "bj-room-created"
+  | "bj-delete-room-result"
+
   | string;
 
 /** Optional per-type payload typing (non-breaking). */
@@ -34,7 +43,14 @@ export type ServerToClientPayloadMap = {
   error: { message: string };
   "chat-broadcast": { text: string };
 
-    // Poker
+  // Lobby
+  "rooms-list": {
+    rooms: any[];
+    game?: string;
+    displayName?: string;
+  };
+
+  // Poker
   "seats-update": {
     seats: Array<{
       seatIndex: number;
@@ -42,14 +58,16 @@ export type ServerToClientPayloadMap = {
       name?: string;
       chips?: number;
     }>;
-    // ✅ server-owned bankroll (off-table). Optional so it’s non-breaking.
     bankrolls?: Record<string, number>;
   };
 
-
-  // Poker (high-level; game files can define richer types if needed)
   "game-status": { started: boolean; handInProgress: boolean };
+
+  // Blackjack lobby create/delete helpers
+  "bj-room-created": { roomId: string };
+  "bj-delete-room-result": { ok: boolean; roomId: string; error?: string };
 };
+
 export type PokerPlayerShowCards = MessageBase & {
   kind: "poker";
   type: "player-show-cards";
@@ -59,7 +77,6 @@ export type PokerPlayerShowCards = MessageBase & {
   reason?: "all-in" | "voluntary";
 };
 
-
 export type ServerToClientMessage = MessageBase & {
   type: ServerToClientType;
   [key: string]: any;
@@ -67,7 +84,6 @@ export type ServerToClientMessage = MessageBase & {
 
 /**
  * Blackjack view types
- * (only used for typing / FE — coordinator just sends plain objects)
  */
 
 export type BlackjackPhase =
@@ -78,7 +94,6 @@ export type BlackjackPhase =
   | "round-complete";
 
 export type BlackjackCard = Card;
-// same "As", "Td" style as cards.ts
 
 export type BlackjackHandResult =
   | "pending"
@@ -95,7 +110,6 @@ export type BlackjackHandState = {
   isStanding: boolean;
   isBlackjack: boolean;
   result: BlackjackHandResult;
-  // net change to bankroll after settlement (can be negative)
   payout: number;
 };
 
@@ -108,7 +122,6 @@ export type BlackjackSeatState = {
 };
 
 export type BlackjackDealerState = {
-  // we allow a face-down marker like "XX" so keep this as string[]
   cards: string[];
   hideHoleCard: boolean;
 };
@@ -122,7 +135,5 @@ export type BlackjackTableState = {
   activeHandIndex: number | null;
   dealer: BlackjackDealerState;
   seats: BlackjackSeatState[];
-
-  // optional betting deadline for countdown UI
   betDeadlineMs?: number | null;
 };

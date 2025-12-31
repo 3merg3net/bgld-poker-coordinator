@@ -4,11 +4,13 @@
   "description": "WebSocket coordinator for Base Gold Rush multiplayer tables (poker, blackjack, etc.)",
   "main": "server.js",
   "scripts": {
-     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
-  "build": "tsc",
-  "start": "node dist/server.js"
+    "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.89.0",
+    "dotenv": "^17.2.3",
     "uuid": "^13.0.0",
     "ws": "^8.18.3"
   },

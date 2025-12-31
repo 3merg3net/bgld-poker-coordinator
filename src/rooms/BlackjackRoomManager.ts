@@ -6,6 +6,7 @@ import type {
   BlackjackTableState,
   BlackjackSeatState,
   BlackjackHandState,
+  BlackjackHandResult,
   BlackjackPhase,
 } from "../types/ServerToClient";
 import type { Card } from "../game/cards";
@@ -19,16 +20,7 @@ const DEFAULT_MIN_BET = 50;
 const DEFAULT_MAX_BET = 5_000;
 
 function parseTierFromRoomId(roomId: string): { minBet: number; maxBet: number } {
-  // Expected formats:
-  //  - bj-100-500-xxxx
-  //  - bj-500-2500-xxxx
-  // You can also support "big-nugget-21-bj-100-500-xxxx" if you ever want:
-  // just search for "-bj-" etc. But keep it strict for safety.
-
   const id = String(roomId || "").toLowerCase();
-
-  // strict: startsWith "bj-"
-  // bj-<min>-<max>-<suffix>
   const m = id.match(/^bj-(\d+)-(\d+)-[a-z0-9]+$/i);
   if (!m) return { minBet: DEFAULT_MIN_BET, maxBet: DEFAULT_MAX_BET };
 
@@ -39,7 +31,6 @@ function parseTierFromRoomId(roomId: string): { minBet: number; maxBet: number }
     return { minBet: DEFAULT_MIN_BET, maxBet: DEFAULT_MAX_BET };
   }
 
-  // hard sanity clamps
   if (minBet < 1) return { minBet: DEFAULT_MIN_BET, maxBet: DEFAULT_MAX_BET };
   if (maxBet < minBet) return { minBet: DEFAULT_MIN_BET, maxBet: DEFAULT_MAX_BET };
   if (maxBet > 1_000_000) return { minBet: DEFAULT_MIN_BET, maxBet: DEFAULT_MAX_BET };
@@ -52,7 +43,7 @@ function handValue(cards: Card[]): { total: number; soft: boolean } {
   let aces = 0;
 
   for (const c of cards) {
-    const rank = c[0]; // "A", "K", "Q", "J", "T", "9", ...
+    const rank = c[0];
     if (rank === "A") {
       aces += 1;
       total += 11;
@@ -78,6 +69,16 @@ function isBlackjack(cards: Card[]): boolean {
   return handValue(cards).total === 21;
 }
 
+function normalizeResult(r: any): BlackjackHandResult {
+  const s = String(r ?? "").toLowerCase();
+  if (!s || s.includes("pending")) return "pending";
+  if (s.includes("push") || s.includes("tie")) return "push";
+  if (s.includes("blackjack") || s === "bj") return "blackjack";
+  if (s === "win" || s.includes("won")) return "win";
+  if (s === "lose" || s.includes("lost")) return "lose";
+  return "pending";
+}
+
 type InternalHand = BlackjackHandState;
 type InternalSeat = BlackjackSeatState;
 
@@ -88,7 +89,6 @@ type ClientInfo = {
 
 export class BlackjackRoomManager {
   readonly roomId: string;
-
   readonly minBet: number;
   readonly maxBet: number;
 
@@ -104,6 +104,12 @@ export class BlackjackRoomManager {
   private betDeadline: number | null = null;
   private betTimer: NodeJS.Timeout | null = null;
   private roundCompleteTimeout: NodeJS.Timeout | null = null;
+
+  // ✅ server-side action timer (prevents client-timeout bugs)
+  private actionDeadline: number | null = null;
+  private actionTimer: NodeJS.Timeout | null = null;
+  private actionKey: string | null = null;
+  private static readonly ACTION_WINDOW_MS = 20_000;
 
   // Dealer suspense
   private dealerHoleRevealed = false;
@@ -176,18 +182,14 @@ export class BlackjackRoomManager {
     this.clients.clear();
     this.clearDealerStepTimeout();
     this.clearRoundCompleteTimeout();
-
-    if (this.betTimer) {
-      clearTimeout(this.betTimer);
-      this.betTimer = null;
-    }
+    this.clearBetTimer();
+    this.clearActionTimer();
     this.betDeadline = null;
   }
 
   // ---- shoe / dealing ----
 
   private resetShoe() {
-    // 6-deck shoe
     let full: Card[] = [];
     for (let i = 0; i < 6; i++) full = full.concat(makeDeck());
     this.shoe = shuffle(full);
@@ -203,9 +205,118 @@ export class BlackjackRoomManager {
     return card;
   }
 
+  // ---- timers (safe clears) ----
+
+  private clearBetTimer() {
+    if (this.betTimer) {
+      clearTimeout(this.betTimer);
+      this.betTimer = null;
+    }
+  }
+
+  private clearDealerStepTimeout() {
+    if (this.dealerStepTimeout) {
+      clearTimeout(this.dealerStepTimeout);
+      this.dealerStepTimeout = null;
+    }
+  }
+
+  private clearRoundCompleteTimeout() {
+    if (this.roundCompleteTimeout) {
+      clearTimeout(this.roundCompleteTimeout);
+      this.roundCompleteTimeout = null;
+    }
+  }
+
+  private clearActionTimer() {
+    if (this.actionTimer) {
+      clearTimeout(this.actionTimer);
+      this.actionTimer = null;
+    }
+    this.actionDeadline = null;
+    this.actionKey = null;
+  }
+
+  /**
+   * ✅ Arm a turn timer ONLY for the active hand.
+   * On timeout, we auto-stand ONLY that hand, then advance.
+   */
+  private armActionTimer() {
+    if (this.phase !== "player-action") {
+      this.clearActionTimer();
+      return;
+    }
+    if (this.activeSeatIndex === null || this.activeHandIndex === null) {
+      this.clearActionTimer();
+      return;
+    }
+
+    this.clearActionTimer();
+
+    const key = `${this.roundId}:${this.activeSeatIndex}:${this.activeHandIndex}`;
+    this.actionKey = key;
+    this.actionDeadline = Date.now() + BlackjackRoomManager.ACTION_WINDOW_MS;
+
+    this.actionTimer = setTimeout(() => {
+      // stale timer guard
+      if (this.phase !== "player-action") return;
+      if (this.actionKey !== key) return;
+      if (this.activeSeatIndex === null || this.activeHandIndex === null) return;
+
+      const seat = this.seats[this.activeSeatIndex];
+      const hand = seat?.hands?.[this.activeHandIndex];
+
+      // if seat/hand is missing or already resolved, just advance
+      if (!seat || !hand) {
+        this.setNextActiveHand();
+        this.broadcastState();
+        return;
+      }
+
+      // ✅ Auto-stand ONLY this hand (never everyone)
+      if (
+        hand.bet > 0 &&
+        normalizeResult(hand.result) === "pending" &&
+        !hand.isBusted &&
+        !hand.isStanding
+      ) {
+        hand.isStanding = true;
+      }
+
+      this.setNextActiveHand();
+      this.broadcastState();
+    }, BlackjackRoomManager.ACTION_WINDOW_MS);
+  }
+
+  // ✅ Safety: after weird events (disconnect/leave), ensure active pointers are valid
+  private advanceGameIfNeeded() {
+    if (this.phase !== "player-action") return;
+
+    if (this.activeSeatIndex === null || this.activeHandIndex === null) {
+      this.setNextActiveHand();
+      return;
+    }
+
+    const seat = this.seats[this.activeSeatIndex];
+    const hand = seat?.hands?.[this.activeHandIndex];
+
+    const invalid =
+      !seat ||
+      !hand ||
+      hand.bet <= 0 ||
+      normalizeResult(hand.result) !== "pending" ||
+      hand.isBusted ||
+      hand.isStanding;
+
+    if (invalid) {
+      this.setNextActiveHand();
+    }
+  }
+
   // ---- public API called from server.ts ----
 
   addClient(playerId: string, socket: WebSocket, name?: string) {
+    // If same player reconnects, replace socket
     this.clients.set(playerId, { socket, name });
     console.log(
       `[BlackjackRoomManager] Player ${playerId} connected to room ${this.roomId}`
@@ -216,11 +327,35 @@ export class BlackjackRoomManager {
   removeClient(playerId: string) {
     this.clients.delete(playerId);
 
-    // free their seat
-    const seat = this.seats.find((s) => s.playerId === playerId);
+    const seatIndex = this.seats.findIndex((s) => s.playerId === playerId);
+    const seat = seatIndex >= 0 ? this.seats[seatIndex] : null;
+
     if (seat) {
-      seat.playerId = null;
-      seat.hands = [];
+      // ✅ Mid-round disconnect: DO NOT clear hands; auto-stand pending hands and keep flow.
+      if (this.phase !== "waiting-bets") {
+        seat.playerId = null;
+
+        for (const h of seat.hands) {
+          if (
+            h.bet > 0 &&
+            normalizeResult(h.result) === "pending" &&
+            !h.isBusted &&
+            !h.isStanding
+          ) {
+            h.isStanding = true;
+          }
+        }
+
+        // If it was their turn, advance immediately
+        if (this.phase === "player-action" && this.activeSeatIndex === seatIndex) {
+          this.clearActionTimer();
+          this.setNextActiveHand();
+        }
+      } else {
+        // waiting-bets: safe to clear
+        seat.playerId = null;
+        seat.hands = [];
+      }
     }
 
     console.log(
@@ -264,6 +399,14 @@ export class BlackjackRoomManager {
         this.sendError(playerId, "Seat already taken");
         return;
       }
+
+      // Don’t allow taking a different seat while already seated elsewhere
+      const otherSeat = this.seats.find((s) => s.playerId === playerId);
+      if (otherSeat && otherSeat.seatIndex !== seatIndex) {
+        this.sendError(playerId, "You are already seated");
+        return;
+      }
+
       seat.playerId = playerId;
       if (name) seat.name = name;
       if (seat.bankroll === undefined || seat.bankroll === null) {
@@ -271,8 +414,24 @@ export class BlackjackRoomManager {
       }
     } else if (action === "leave") {
       if (seat.playerId === playerId) {
+        // ✅ leaving mid-round: auto-stand pending hands so game flow never freezes
+        for (const h of seat.hands) {
+          if (
+            h.bet > 0 &&
+            normalizeResult(h.result) === "pending" &&
+            !h.isBusted &&
+            !h.isStanding
+          ) {
+            h.isStanding = true;
+          }
+        }
+
         seat.playerId = null;
-        seat.hands = [];
+
+        // If it was their active turn, advance safely
+        if (this.phase === "player-action") {
+          this.advanceGameIfNeeded();
+        }
       }
     }
 
@@ -282,10 +441,7 @@ export class BlackjackRoomManager {
   // ---- betting + round lifecycle ----
 
   private openBetWindow() {
-    if (this.betTimer) {
-      clearTimeout(this.betTimer);
-      this.betTimer = null;
-    }
+    this.clearBetTimer();
 
     this.phase = "waiting-bets";
     this.betDeadline = Date.now() + BlackjackRoomManager.BET_WINDOW_MS;
@@ -301,6 +457,7 @@ export class BlackjackRoomManager {
         this.dealerCards = [];
         this.activeSeatIndex = null;
         this.activeHandIndex = null;
+        this.clearActionTimer();
         this.broadcastState();
         return;
       }
@@ -309,20 +466,16 @@ export class BlackjackRoomManager {
     }, BlackjackRoomManager.BET_WINDOW_MS);
   }
 
-  private clearDealerStepTimeout() {
-    if (this.dealerStepTimeout) {
-      clearTimeout(this.dealerStepTimeout);
-      this.dealerStepTimeout = null;
-    }
-  }
-
   private handlePlaceBet(msg: ClientToServerMessage) {
     if (this.phase === "round-complete") {
+      // allow “bet next hand” to immediately reopen betting
       this.clearRoundCompleteTimeout();
       this.phase = "waiting-bets";
       this.dealerCards = [];
       this.activeSeatIndex = null;
       this.activeHandIndex = null;
+      this.clearDealerStepTimeout();
+      this.clearActionTimer();
       for (const seat of this.seats) seat.hands = [];
     } else if (this.phase !== "waiting-bets") {
       this.sendError(msg.playerId, "Cannot bet right now");
@@ -331,15 +484,9 @@ export class BlackjackRoomManager {
 
     const seatIndex = typeof msg.seatIndex === "number" ? msg.seatIndex : -1;
     const amount = Number(msg.amount ?? 0);
-
     if (seatIndex < 0 || seatIndex >= MAX_SEATS) return;
 
-    // ✅ per-room min/max enforced (server-trusted)
-    if (
-      !Number.isFinite(amount) ||
-      amount < this.minBet ||
-      amount > this.maxBet
-    ) {
+    if (!Number.isFinite(amount) || amount < this.minBet || amount > this.maxBet) {
       this.sendError(
         msg.playerId,
         `Invalid bet amount (min ${this.minBet}, max ${this.maxBet})`
@@ -358,10 +505,8 @@ export class BlackjackRoomManager {
       return;
     }
 
-    const existingHand = seat.hands.find(
-      (h) => h.bet > 0 && h.cards.length === 0
-    );
-
+    // Only allow a pre-deal bet “stub” in waiting-bets
+    const existingHand = seat.hands.find((h) => h.bet > 0 && h.cards.length === 0);
     if (existingHand) {
       seat.bankroll -= amount;
       existingHand.bet += amount;
@@ -390,8 +535,11 @@ export class BlackjackRoomManager {
 
   private startRound() {
     this.roundId += 1;
+
     this.phase = "dealing";
     this.clearDealerStepTimeout();
+    this.clearRoundCompleteTimeout();
+    this.clearActionTimer();
     this.dealerHoleRevealed = false;
 
     this.dealerCards = [];
@@ -420,30 +568,47 @@ export class BlackjackRoomManager {
     this.betDeadline = null;
 
     this.phase = "player-action";
+
+    // start from the first eligible hand
+    this.activeSeatIndex = null;
+    this.activeHandIndex = null;
     this.setNextActiveHand();
+
     this.broadcastState();
   }
 
+  /**
+   * ✅ Select next hand that still needs action.
+   * Arms timer for that hand only.
+   */
   private setNextActiveHand() {
+    // clear existing timer whenever we are re-evaluating turns
+    this.clearActionTimer();
+
     for (let si = 0; si < this.seats.length; si++) {
       const seat = this.seats[si];
       for (let hi = 0; hi < seat.hands.length; hi++) {
         const hand = seat.hands[hi];
         if (
           hand.bet > 0 &&
+          normalizeResult(hand.result) === "pending" &&
           !hand.isBusted &&
-          !hand.isStanding &&
-          hand.result === "pending"
+          !hand.isStanding
         ) {
           this.activeSeatIndex = si;
           this.activeHandIndex = hi;
+
+          // ✅ start a fresh timer ONLY for the active seat/hand
+          this.armActionTimer();
           return;
         }
       }
     }
 
+    // no more player actions
     this.activeSeatIndex = null;
     this.activeHandIndex = null;
+    this.clearActionTimer();
     this.startDealerTurn();
   }
 
@@ -466,6 +631,7 @@ export class BlackjackRoomManager {
       this.clearRoundCompleteTimeout();
       this.prepareNextRound();
       this.clearDealerStepTimeout();
+      this.clearActionTimer();
       return;
     }
 
@@ -494,15 +660,16 @@ export class BlackjackRoomManager {
 
     if (action === "reload-demo") {
       const TARGET_BANKROLL = 5000;
-      if (seat.bankroll < TARGET_BANKROLL) {
-        seat.bankroll = TARGET_BANKROLL;
-      }
+      if (seat.bankroll < TARGET_BANKROLL) seat.bankroll = TARGET_BANKROLL;
       this.broadcastState();
       return;
     }
 
     const hand = seat.hands[this.activeHandIndex];
     if (!hand) return;
+
+    // ✅ consume turn timer on any valid action attempt
+    this.clearActionTimer();
 
     switch (action) {
       case "hit":
@@ -516,6 +683,8 @@ export class BlackjackRoomManager {
         break;
       case "split":
         this.handleSplit(seat, hand);
+        break;
+      default:
         break;
     }
 
@@ -584,13 +753,20 @@ export class BlackjackRoomManager {
     hand.payout = 0;
 
     seat.hands = [hand, newHand];
+
+    // After split, player should act on hand 0 first
     this.activeHandIndex = 0;
+    this.activeSeatIndex = seat.seatIndex;
+
+    // ✅ re-arm timer for this new “same-seat” turn
+    this.armActionTimer();
   }
 
   // ---- dealer + settlement ----
 
   private startDealerTurn() {
     this.phase = "dealer-turn";
+    this.clearActionTimer(); // ✅ stop player timer
     this.clearDealerStepTimeout();
     this.dealerHoleRevealed = false;
 
@@ -676,15 +852,9 @@ export class BlackjackRoomManager {
         hand.isBlackjack = bj;
         hand.isBusted = bust;
 
+        // bankroll settles back locally (your real GLD settlement is handled by client)
         seat.bankroll += hand.bet + payout;
       }
-    }
-  }
-
-  private clearRoundCompleteTimeout() {
-    if (this.roundCompleteTimeout) {
-      clearTimeout(this.roundCompleteTimeout);
-      this.roundCompleteTimeout = null;
     }
   }
 
@@ -692,7 +862,7 @@ export class BlackjackRoomManager {
     this.clearRoundCompleteTimeout();
     this.roundCompleteTimeout = setTimeout(() => {
       this.prepareNextRound();
-    }, 15_000);
+    }, 4500);
   }
 
   private prepareNextRound() {
@@ -702,12 +872,10 @@ export class BlackjackRoomManager {
     this.activeHandIndex = null;
 
     this.clearDealerStepTimeout();
+    this.clearActionTimer();
     this.dealerHoleRevealed = false;
 
-    if (this.betTimer) {
-      clearTimeout(this.betTimer);
-      this.betTimer = null;
-    }
+    this.clearBetTimer();
     this.betDeadline = null;
 
     for (const seat of this.seats) seat.hands = [];

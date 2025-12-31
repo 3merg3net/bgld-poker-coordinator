@@ -4,6 +4,10 @@ import type { ClientToServerMessage } from "../types/ClientToServer";
 import type { ServerToClientMessage } from "../types/ServerToClient";
 import { HoldemGame, SeatView } from "../game/HoldemGame";
 
+// ✅ Supabase-backed PGLD bankroll helpers (you said you'll add the new files)
+import { creditPgld, debitPgld, getPgld } from "../chips/pgldBankroll";
+
+
 type ClientEntry = {
   socket: WebSocket;
   playerId: string;
@@ -16,17 +20,80 @@ export class PokerRoomManager {
   private seats: SeatView[] = [];
   private game: HoldemGame = new HoldemGame();
 
-  private handInProgress = false;
-  private totalFakeRake = 0;
+  // ─────────────────────────────────────────────────────────────
+  // ROOM META (for lobby display + sharing)
+  // ─────────────────────────────────────────────────────────────
+  private tableName: string | null = null;
+  private isPrivate: boolean = false;
 
-  // ✅ Server-owned PGLD bankroll (off-table)
-  private bankrolls: Map<string, number> = new Map();
-  private static readonly DEMO_BANKROLL_DEFAULT = 5_000;
+  private handInProgress = false;
+
+  private totalFakeRake = 0;
 
   // ✅ Server-owned auto-deal timer + reveal tracking
   private autoDealTimer: NodeJS.Timeout | null = null;
   private revealedThisHand: Set<string> = new Set();
   private static readonly AUTO_DEAL_DELAY_MS = 10_000;
+
+  // ✅ Optional: lightweight bankroll cache to reduce Supabase reads
+  private bankrollCache: Map<string, { v: number; ts: number }> = new Map();
+  private static readonly BANKROLL_CACHE_TTL_MS = 2_000;
+
+    // ─────────────────────────────────────────────────────────────
+  // DEMO FALLBACK (in-memory) — used when Supabase bankroll calls fail
+  // ─────────────────────────────────────────────────────────────
+  private demoBankroll: Map<string, number> = new Map();
+
+  private getDemoBankroll(playerId: string) {
+    return Math.max(0, Math.floor(this.demoBankroll.get(playerId) ?? 0));
+  }
+
+  private setDemoBankroll(playerId: string, v: number) {
+    this.demoBankroll.set(playerId, Math.max(0, Math.floor(v)));
+  }
+
+  private async safeGetBankroll(playerId: string): Promise<number> {
+    try {
+      return await getPgld(playerId);
+    } catch {
+      // Supabase down / not configured → fallback
+      return this.getDemoBankroll(playerId);
+    }
+  }
+
+  private async safeCredit(playerId: string, amount: number, txType: string, ref?: any, meta?: any) {
+    const amt = Math.max(0, Math.floor(amount));
+    if (amt <= 0) return;
+
+    try {
+      await creditPgld({ playerId, amount: amt, txType: txType as any, ref, meta });
+      return;
+    } catch {
+      // fallback
+      this.setDemoBankroll(playerId, this.getDemoBankroll(playerId) + amt);
+    }
+  }
+
+  private async safeDebit(playerId: string, amount: number, txType: string, ref?: any, meta?: any) {
+    const amt = Math.max(0, Math.floor(amount));
+    if (amt <= 0) return;
+
+    try {
+      await debitPgld({ playerId, amount: amt, txType: txType as any, ref, meta });
+      return;
+    } catch (e: any) {
+      // fallback
+      const cur = this.getDemoBankroll(playerId);
+      if (cur < amt) {
+        const err: any = new Error("INSUFFICIENT_PGLD");
+        err.message = "INSUFFICIENT_PGLD";
+        throw err;
+      }
+      this.setDemoBankroll(playerId, cur - amt);
+    }
+  }
+
+  
 
   constructor(roomId: string) {
     this.roomId = roomId;
@@ -42,35 +109,50 @@ export class PokerRoomManager {
   }
 
   // ─────────────────────────────────────────────────────────────
-  // BANKROLL HELPERS (single source of truth)
+  // BANKROLL HELPERS (single source of truth = Supabase)
   // ─────────────────────────────────────────────────────────────
 
-  private getBankroll(playerId: string): number {
-    if (!this.bankrolls.has(playerId)) {
-      this.bankrolls.set(playerId, PokerRoomManager.DEMO_BANKROLL_DEFAULT);
+  private invalidateBankroll(playerId: string) {
+    this.bankrollCache.delete(playerId);
+  }
+
+    private async getBankroll(playerId: string): Promise<number> {
+    const cached = this.bankrollCache.get(playerId);
+    const now = Date.now();
+    if (cached && now - cached.ts <= PokerRoomManager.BANKROLL_CACHE_TTL_MS) {
+      return cached.v;
     }
-    return this.bankrolls.get(playerId)!;
+
+    const v = await this.safeGetBankroll(playerId);
+    const amt = Math.max(0, Math.floor(Number(v) || 0));
+    this.bankrollCache.set(playerId, { v: amt, ts: now });
+    return amt;
   }
 
-  private setBankroll(playerId: string, value: number) {
-    const v = Math.max(0, Math.floor(Number(value) || 0));
-    this.bankrolls.set(playerId, v);
-  }
 
-  private bankrollsSnapshot(): Record<string, number> {
+    private async bankrollsSnapshot(): Promise<Record<string, number>> {
     const out: Record<string, number> = {};
-    for (const [pid, amt] of this.bankrolls.entries()) out[pid] = amt;
+    for (const pid of this.clients.keys()) {
+      // never drop the key — default to 0 if anything goes wrong
+      try {
+        out[pid] = await this.getBankroll(pid);
+      } catch {
+        out[pid] = 0;
+      }
+    }
     return out;
   }
 
-  private broadcastSeats() {
+
+  private async broadcastSeats() {
+    const bankrolls = await this.bankrollsSnapshot();
     this.broadcast({
       kind: "poker",
       roomId: this.roomId,
       playerId: "server",
       type: "seats-update",
       seats: this.seats,
-      bankrolls: this.bankrollsSnapshot(), // ✅ extra field (non-breaking)
+      bankrolls, // ✅ extra field (non-breaking)
     } as any);
   }
 
@@ -88,7 +170,7 @@ export class PokerRoomManager {
     return min;
   }
 
-  private isHost(playerId: string): boolean {
+  public isHost(playerId: string): boolean {
     const seat = this.seats.find((s) => s.playerId === playerId);
     if (!seat) return false;
     const hostIdx = this.getHostSeatIndex();
@@ -114,13 +196,16 @@ export class PokerRoomManager {
   }
 
   public getSnapshot() {
-    const seatedCount = this.seats.filter((s) => !!s.playerId).length;
-    return {
-      roomId: this.roomId,
-      onlineCount: this.clients.size,
-      seatedCount,
-    };
-  }
+  const seatedCount = this.seats.filter((s) => !!s.playerId).length;
+  return {
+    roomId: this.roomId,
+    tableName: this.tableName,
+    private: this.isPrivate ? "1" : "0",
+    onlineCount: this.clients.size,
+    seatedCount,
+  };
+}
+
 
   public getCounts() {
     const onlineCount = this.clients.size;
@@ -132,31 +217,59 @@ export class PokerRoomManager {
   // CLIENT JOIN/LEAVE
   // ─────────────────────────────────────────────────────────────
 
-  addClient(playerId: string, socket: WebSocket, name?: string) {
-    this.clients.set(playerId, { socket, playerId, name });
+  addClient(
+  playerId: string,
+  socket: WebSocket,
+  name?: string,
+  meta?: { tableName?: string; private?: string | boolean | number }
+) {
+  this.clients.set(playerId, { socket, playerId, name });
 
-    // ✅ ensure bankroll exists for this playerId
-    this.getBankroll(playerId);
+  // Capture room meta once (first writer wins)
+  // This is what the lobby uses to show the human table name.
+  try {
+    if (!this.tableName) {
+      const raw =
+        typeof meta?.tableName === "string" ? meta.tableName.trim() : "";
+      if (raw) this.tableName = raw.slice(0, 24);
+    }
 
-    this.cleanupGhostSeats();
+    // Accept: "1", true, 1, "true"
+    if (!this.isPrivate) {
+      const p = meta?.private;
+      const isP =
+        p === "1" ||
+        p === 1 ||
+        p === true ||
+        (typeof p === "string" && p.toLowerCase() === "true");
+      if (isP) this.isPrivate = true;
+    }
+  } catch {}
 
-    this.broadcast({
-      kind: "poker",
-      roomId: this.roomId,
-      playerId,
-      type: "room-joined",
-      onlineCount: this.clients.size,
-    } as any);
+  this.cleanupGhostSeats();
+
+  this.broadcast({
+    kind: "poker",
+    roomId: this.roomId,
+    playerId,
+    type: "room-joined",
+    onlineCount: this.clients.size,
+  } as any);
+
 
     // send seats + bankrolls to the joining client
-    this.sendTo(playerId, {
-      kind: "poker",
-      roomId: this.roomId,
-      playerId,
-      type: "seats-update",
-      seats: this.seats,
-      bankrolls: this.bankrollsSnapshot(),
-    } as any);
+    // (fire-and-forget so join isn't blocked by Supabase latency)
+    (async () => {
+      const bankrolls = await this.bankrollsSnapshot();
+      this.sendTo(playerId, {
+        kind: "poker",
+        roomId: this.roomId,
+        playerId,
+        type: "seats-update",
+        seats: this.seats,
+        bankrolls,
+      } as any);
+    })();
 
     const lastTable = this.game.getLastState();
     if (lastTable) {
@@ -199,20 +312,45 @@ export class PokerRoomManager {
 
     // If disconnect while seated, return stack to bankroll, then clear seat
     let changed = false;
+    const stackToReturn = (() => {
+      const seat = this.seats.find((s) => s.playerId === playerId);
+      const stack = Math.max(0, Math.floor(Number(seat?.chips ?? 0)));
+      return stack;
+    })();
+
     this.seats = this.seats.map((s) => {
       if (s.playerId === playerId) {
         changed = true;
-        const stack = Math.max(0, Math.floor(Number(s.chips ?? 0)));
-        if (stack > 0) {
-          const cur = this.getBankroll(playerId);
-          this.setBankroll(playerId, cur + stack);
-        }
         return { ...s, playerId: null, name: undefined, chips: 0 };
       }
       return s;
     });
 
-    if (changed) this.broadcastSeats();
+    // Return stack asynchronously (don’t block disconnect)
+    if (stackToReturn > 0) {
+      (async () => {
+        try {
+                    await this.safeCredit(
+            playerId,
+            stackToReturn,
+            "poker_cashout",
+            this.roomId,
+            { reason: "disconnect" }
+          );
+
+          this.invalidateBankroll(playerId);
+          await this.broadcastSeats();
+        } catch {
+          // If this fails, bankroll will reconcile next time via other flows;
+          // you can also add a retry queue later.
+        }
+      })();
+    }
+
+    if (changed) {
+      // broadcast immediately (seat cleared), bankroll update follows when credit completes
+      void this.broadcastSeats();
+    }
 
     this.broadcast({
       kind: "poker",
@@ -257,7 +395,7 @@ export class PokerRoomManager {
         return;
 
       case "sit":
-        this.handleSit(
+        void this.handleSit(
           playerId,
           (msg as any).buyIn,
           (msg as any).seatIndex,
@@ -266,15 +404,15 @@ export class PokerRoomManager {
         return;
 
       case "stand":
-        this.handleStand(playerId);
+        void this.handleStand(playerId);
         return;
 
       case "refill-stack":
-        this.handleRefillStack(playerId, (msg as any).amount);
+        void this.handleRefillStack(playerId, (msg as any).amount);
         return;
 
       case "demo-topup":
-        this.handleDemoTopup(playerId, (msg as any).target);
+        void this.handleDemoTopup(playerId, (msg as any).target);
         return;
 
       case "action":
@@ -304,7 +442,7 @@ export class PokerRoomManager {
   // SITTING / STANDING
   // ─────────────────────────────────────────────────────────────
 
-  private handleSit(
+  private async handleSit(
     playerId: string,
     buyIn?: number,
     seatIndex?: number,
@@ -334,21 +472,34 @@ export class PokerRoomManager {
       return;
     }
 
-    const bankroll = this.getBankroll(playerId);
     const desired = Math.max(100, Math.floor(Number(buyIn ?? 0)));
+    if (!Number.isFinite(desired) || desired <= 0) return;
 
-    if (desired > bankroll) {
+    // ✅ Debit Supabase bankroll FIRST, then seat
+        try {
+      await this.safeDebit(
+        playerId,
+        desired,
+        "poker_buyin",
+        this.roomId,
+        { seatIndex: targetSeat.seatIndex }
+      );
+      this.invalidateBankroll(playerId);
+    } catch (e: any) {
+      const msg =
+        e?.message === "INSUFFICIENT_PGLD"
+          ? `Not enough PGLD bankroll to buy in for ${desired}.`
+          : "Buy-in failed.";
       this.sendTo(playerId, {
         kind: "poker",
         roomId: this.roomId,
         playerId,
         type: "error",
-        message: `Not enough PGLD bankroll to buy in for ${desired}.`,
+        message: msg,
       } as any);
       return;
     }
 
-    this.setBankroll(playerId, bankroll - desired);
 
     this.seats = this.seats.map((s) =>
       s.seatIndex === targetSeat!.seatIndex
@@ -361,7 +512,7 @@ export class PokerRoomManager {
         : s
     );
 
-    this.broadcastSeats();
+    await this.broadcastSeats();
 
     // If table idle and 2+ players with chips, arm auto-deal
     if (!this.handInProgress) {
@@ -374,7 +525,7 @@ export class PokerRoomManager {
     }
   }
 
-  private handleStand(playerId: string) {
+  private async handleStand(playerId: string) {
     // only allow stand between hands
     const betting = this.game.getBettingState();
     if (betting && betting.street !== "done") return;
@@ -383,21 +534,41 @@ export class PokerRoomManager {
     if (!seat) return;
 
     const stack = Math.max(0, Math.floor(Number(seat.chips ?? 0)));
-    if (stack > 0) {
-      const cur = this.getBankroll(playerId);
-      this.setBankroll(playerId, cur + stack);
-    }
 
+    // Clear seat first (prevents duplicate cashouts if client spams)
     this.seats = this.seats.map((s) =>
       s.playerId === playerId
         ? { ...s, playerId: null, name: undefined, chips: 0 }
         : s
     );
 
-    this.broadcastSeats();
+    // Credit Supabase bankroll
+        if (stack > 0) {
+      try {
+        await this.safeCredit(
+          playerId,
+          stack,
+          "poker_cashout",
+          this.roomId,
+          { seatIndex: seat.seatIndex }
+        );
+        this.invalidateBankroll(playerId);
+      } catch {
+        this.sendTo(playerId, {
+          kind: "poker",
+          roomId: this.roomId,
+          playerId,
+          type: "error",
+          message: "Cashout failed.",
+        } as any);
+      }
+    }
+
+
+    await this.broadcastSeats();
   }
 
-  private handleRefillStack(playerId: string, amount?: number) {
+  private async handleRefillStack(playerId: string, amount?: number) {
     // only between hands
     const betting = this.game.getBettingState();
     if (betting && betting.street !== "done") return;
@@ -408,26 +579,38 @@ export class PokerRoomManager {
     const requested = Math.max(0, Math.floor(Number(amount ?? 0)));
     if (!Number.isFinite(requested) || requested <= 0) return;
 
-    const bankroll = this.getBankroll(playerId);
-    if (requested > bankroll) {
+    // ✅ Debit Supabase bankroll
+       try {
+      await this.safeDebit(
+        playerId,
+        requested,
+        "poker_refill",
+        this.roomId,
+        { seatIndex: seat.seatIndex }
+      );
+      this.invalidateBankroll(playerId);
+    } catch (e: any) {
+      const msg =
+        e?.message === "INSUFFICIENT_PGLD"
+          ? `Not enough PGLD bankroll to refill ${requested}.`
+          : "Refill failed.";
       this.sendTo(playerId, {
         kind: "poker",
         roomId: this.roomId,
         playerId,
         type: "error",
-        message: `Not enough PGLD bankroll to refill ${requested}.`,
+        message: msg,
       } as any);
       return;
     }
 
-    this.setBankroll(playerId, bankroll - requested);
 
     this.seats = this.seats.map((s) => {
       if (s.playerId !== playerId) return s;
       return { ...s, chips: (s.chips ?? 0) + requested };
     });
 
-    this.broadcastSeats();
+    await this.broadcastSeats();
 
     if (!this.handInProgress) {
       const eligible = this.seats.filter(
@@ -439,19 +622,37 @@ export class PokerRoomManager {
     }
   }
 
-  private handleDemoTopup(playerId: string, target?: number) {
-    const tgt = Math.max(
-      0,
-      Math.floor(Number(target ?? PokerRoomManager.DEMO_BANKROLL_DEFAULT))
-    );
+    private async handleDemoTopup(playerId: string, target?: number) {
+    const tgt = Math.max(0, Math.floor(Number(target ?? 5_000)));
+    if (!Number.isFinite(tgt)) return;
 
-    const cur = this.getBankroll(playerId);
+    let cur = 0;
+    try {
+      cur = await this.getBankroll(playerId);
+    } catch {
+      cur = this.getDemoBankroll(playerId);
+    }
+
     if (cur >= tgt) {
-      this.broadcastSeats();
+      await this.broadcastSeats();
       return;
     }
 
-    this.setBankroll(playerId, tgt);
+    const delta = tgt - cur;
+
+    try {
+      await this.safeCredit(playerId, delta, "demo_topup", this.roomId, { target: tgt });
+      this.invalidateBankroll(playerId);
+    } catch {
+      this.sendTo(playerId, {
+        kind: "poker",
+        roomId: this.roomId,
+        playerId,
+        type: "error",
+        message: "Demo topup failed.",
+      } as any);
+      return;
+    }
 
     this.sendTo(playerId, {
       kind: "poker",
@@ -461,8 +662,9 @@ export class PokerRoomManager {
       text: `Demo bankroll topped up to ${tgt.toLocaleString()} PGLD.`,
     } as any);
 
-    this.broadcastSeats();
+    await this.broadcastSeats();
   }
+
 
   // ─────────────────────────────────────────────────────────────
   // HAND LIFECYCLE
@@ -677,7 +879,7 @@ export class PokerRoomManager {
         return s;
       });
 
-      this.broadcastSeats();
+      void this.broadcastSeats();
 
       this.handInProgress = false;
 
@@ -748,7 +950,7 @@ export class PokerRoomManager {
       return s;
     });
 
-    if (changed) this.broadcastSeats();
+    if (changed) void this.broadcastSeats();
   }
 
   private resetTableState() {
@@ -770,8 +972,47 @@ export class PokerRoomManager {
     this.handInProgress = false;
     this.totalFakeRake = 0;
 
-    console.log(`[PokerRoom:${this.roomId}] All clients gone. Resetting table state.`);
+    console.log(
+      `[PokerRoom:${this.roomId}] All clients gone. Resetting table state.`
+    );
   }
+
+  public shutdown(reason = "Room shutdown") {
+  // stop timers
+  this.clearAutoDealTimer();
+  this.revealedThisHand.clear();
+
+  // tell clients
+  try {
+    this.broadcast({
+      kind: "poker",
+      roomId: this.roomId,
+      playerId: "server",
+      type: "chat-broadcast",
+      text: reason,
+    } as any);
+
+    this.broadcast({
+      kind: "poker",
+      roomId: this.roomId,
+      playerId: "server",
+      type: "room-closed",
+      reason,
+    } as any);
+  } catch {}
+
+  // force close sockets
+  for (const { socket } of this.clients.values()) {
+    try {
+      socket.close(1000, reason);
+    } catch {}
+  }
+
+  // wipe
+  this.clients.clear();
+  this.resetTableState();
+}
+
 
   // ─────────────────────────────────────────────────────────────
   // LOW-LEVEL SEND HELPERS
