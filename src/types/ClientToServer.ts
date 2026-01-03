@@ -26,6 +26,10 @@ export type ClientToServerType =
   | "refill-stack"
   | "close-room"
 
+  // ✅ tournaments (coordinator-level)
+  | "tournament-create"
+  | "tournament-join"
+
   // blackjack
   | "bj-seat"
   | "bj-place-bet"
@@ -63,6 +67,22 @@ export type ClientToServerPayloadMap = {
 
   // ✅ poker host close (used inside room)
   "close-room": { roomId: string; playerId: string };
+
+   // ✅ Tournaments
+  "tournament-create": {
+    playerId: string;
+    tournamentName?: string;
+    buyIn: number;          // chips buy-in (e.g. 10_000)
+    startingStack: number;  // stack each entrant gets at table
+    seatsPerTable?: number; // default 9
+    isPrivate?: boolean;
+  };
+
+  "tournament-join": {
+    playerId: string;
+    tournamentId: string;
+    name?: string;          // display name
+  };
 
   // ── Blackjack
   "bj-seat": { action: "sit" | "leave"; seatIndex: number; name?: string };

@@ -6,6 +6,8 @@ import type WebSocket from "ws";
 import type { ClientToServerMessage } from "./types/ClientToServer";
 import { PokerRoomManager } from "./rooms/PokerRoomManager";
 import { BlackjackRoomManager } from "./rooms/BlackjackRoomManager";
+import { TournamentDirector } from "./tournaments/TournamentDirector";
+
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
 
@@ -44,6 +46,8 @@ type RoomMeta<T> = {
 
 const pokerRooms = new Map<string, RoomMeta<PokerRoomManager>>();
 const blackjackRooms = new Map<string, RoomMeta<BlackjackRoomManager>>();
+const tournaments = new TournamentDirector();
+
 
 function touchRoom(kind: GameKind, roomId: string) {
   const now = Date.now();
@@ -56,10 +60,16 @@ function touchRoom(kind: GameKind, roomId: string) {
   }
 }
 
+function isTournamentRoomId(roomId: string) {
+  return String(roomId).startsWith("tourn-"); // matches TournamentDirector ids
+}
+
 function getPokerRoom(roomId: string): PokerRoomManager {
   let meta = pokerRooms.get(roomId);
   if (!meta) {
-    const room = new PokerRoomManager(roomId);
+    const room = new PokerRoomManager(roomId, {
+      mode: isTournamentRoomId(roomId) ? "tournament" : "cash",
+    });
     meta = { room, lastActiveAt: Date.now() };
     pokerRooms.set(roomId, meta);
   } else {
@@ -67,6 +77,7 @@ function getPokerRoom(roomId: string): PokerRoomManager {
   }
   return meta.room;
 }
+
 
 function getBlackjackRoom(roomId: string): BlackjackRoomManager {
   let meta = blackjackRooms.get(roomId);
@@ -496,6 +507,92 @@ wss.on("connection", (socket: WebSocket) => {
       });
       return;
     }
+
+    // ✅ TOURNAMENT: create (no join required)
+if (typed.kind === "poker" && typed.type === "tournament-create") {
+  const playerId = String((typed as any).playerId ?? "").trim();
+  if (!playerId) {
+    safeSend(socket, { kind:"poker", type:"tournament-created", ok:false, error:"Missing playerId" });
+    return;
+  }
+
+  const buyIn = Number((typed as any).buyIn ?? 0);
+  const startingStack = Number((typed as any).startingStack ?? 0);
+  const seatsPerTable = Number((typed as any).seatsPerTable ?? 9);
+  const isPrivate = Boolean((typed as any).isPrivate);
+
+  if (!Number.isFinite(buyIn) || buyIn <= 0 || !Number.isFinite(startingStack) || startingStack <= 0) {
+    safeSend(socket, { kind:"poker", type:"tournament-created", ok:false, error:"Invalid buyIn/startingStack" });
+    return;
+  }
+
+  const { tournamentId, firstTableRoomId } = tournaments.createTournament({
+    tournamentName: String((typed as any).tournamentName ?? "Tournament"),
+    buyIn,
+    startingStack,
+    seatsPerTable,
+    isPrivate,
+  });
+
+  // Ensure the first table room exists in coordinator map
+  getPokerRoom(firstTableRoomId);
+
+  // Auto-assign creator into the tournament (table selection)
+  const joinRes = tournaments.joinTournament(tournamentId, playerId);
+
+  safeSend(socket, {
+    kind: "poker",
+    type: "tournament-created",
+    ok: true,
+    tournamentId,
+    tableRoomId: joinRes.tableRoomId ?? firstTableRoomId,
+  });
+
+  return;
+}
+
+// ✅ TOURNAMENT: join (no join required)
+if (typed.kind === "poker" && typed.type === "tournament-join") {
+  const playerId = String((typed as any).playerId ?? "").trim();
+  const tournamentId = String((typed as any).tournamentId ?? "").trim();
+
+  if (!playerId || !tournamentId) {
+    safeSend(socket, {
+      kind: "poker",
+      type: "tournament-join-result",
+      ok: false,
+      tournamentId: tournamentId || "unknown",
+      error: "Missing playerId/tournamentId",
+    });
+    return;
+  }
+
+  const res = tournaments.joinTournament(tournamentId, playerId);
+  if (!res.ok || !res.tableRoomId) {
+    safeSend(socket, {
+      kind: "poker",
+      type: "tournament-join-result",
+      ok: false,
+      tournamentId,
+      error: res.error || "Join failed",
+    });
+    return;
+  }
+
+  // Ensure table exists
+  getPokerRoom(res.tableRoomId);
+
+  safeSend(socket, {
+    kind: "poker",
+    type: "tournament-join-result",
+    ok: true,
+    tournamentId,
+    tableRoomId: res.tableRoomId,
+  });
+
+  return;
+}
+
 
     // JOIN ROOM
     if (typed.type === "join-room") {

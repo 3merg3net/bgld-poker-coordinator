@@ -92,11 +92,12 @@ export class PokerRoomManager {
       this.setDemoBankroll(playerId, cur - amt);
     }
   }
-
+private mode: "cash" | "tournament" = "cash";
   
 
-  constructor(roomId: string) {
-    this.roomId = roomId;
+  constructor(roomId: string, opts?: { mode?: "cash" | "tournament" }) {
+  this.roomId = roomId;
+  this.mode = opts?.mode ?? "cash";
 
     for (let i = 0; i < 9; i++) {
       this.seats.push({
@@ -107,6 +108,8 @@ export class PokerRoomManager {
       });
     }
   }
+
+  
 
   // ─────────────────────────────────────────────────────────────
   // BANKROLL HELPERS (single source of truth = Supabase)
@@ -313,10 +316,10 @@ export class PokerRoomManager {
     // If disconnect while seated, return stack to bankroll, then clear seat
     let changed = false;
     const stackToReturn = (() => {
-      const seat = this.seats.find((s) => s.playerId === playerId);
-      const stack = Math.max(0, Math.floor(Number(seat?.chips ?? 0)));
-      return stack;
-    })();
+  const seat = this.seats.find((s) => s.playerId === playerId);
+  const stack = Math.max(0, Math.floor(Number(seat?.chips ?? 0)));
+  return stack;
+})();
 
     this.seats = this.seats.map((s) => {
       if (s.playerId === playerId) {
@@ -362,6 +365,24 @@ export class PokerRoomManager {
     if (this.clients.size === 0) {
       this.resetTableState();
     }
+    if (this.mode === "cash" && stackToReturn > 0) {
+  (async () => {
+    try {
+      await this.safeCredit(
+        playerId,
+        stackToReturn,
+        "poker_cashout",
+        this.roomId,
+        { reason: "disconnect" }
+      );
+      this.invalidateBankroll(playerId);
+      await this.broadcastSeats();
+    } catch {}
+  })();
+} else {
+  // tournament mode: no auto-cashout
+  void this.broadcastSeats();
+}
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -541,6 +562,25 @@ export class PokerRoomManager {
         ? { ...s, playerId: null, name: undefined, chips: 0 }
         : s
     );
+
+    if (this.mode === "cash") {
+  if (stack > 0) {
+    try {
+      await this.safeCredit(
+        playerId,
+        stack,
+        "poker_cashout",
+        this.roomId,
+        { seatIndex: seat.seatIndex }
+      );
+      this.invalidateBankroll(playerId);
+    } catch {
+      this.sendTo(playerId, { kind:"poker", roomId:this.roomId, playerId, type:"error", message:"Cashout failed." } as any);
+    }
+  }
+} else {
+  // tournament mode: leaving forfeits stack (or treat as sitout later)
+}
 
     // Credit Supabase bankroll
         if (stack > 0) {

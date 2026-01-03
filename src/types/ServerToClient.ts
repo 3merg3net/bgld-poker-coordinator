@@ -27,6 +27,10 @@ export type ServerToClientType =
   | "player-show-cards"
   | "game-status"
 
+    // ✅ tournaments
+  | "tournament-created"
+  | "tournament-join-result"
+
   // blackjack (legacy labels allowed)
   | "blackjack-state"
   | "blackjack-seats"
@@ -60,8 +64,22 @@ export type ServerToClientPayloadMap = {
     }>;
     bankrolls?: Record<string, number>;
   };
+   "game-status": { started: boolean; handInProgress: boolean };
 
-  "game-status": { started: boolean; handInProgress: boolean };
+    // ✅ tournaments
+  "tournament-created": {
+    ok: boolean;
+    tournamentId?: string;
+    tableRoomId?: string;
+    error?: string;
+  };
+
+  "tournament-join-result": {
+    ok: boolean;
+    tournamentId: string;
+    tableRoomId?: string;
+    error?: string;
+  };
 
   // Blackjack lobby create/delete helpers
   "bj-room-created": { roomId: string };
