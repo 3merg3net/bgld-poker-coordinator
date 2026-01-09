@@ -8,7 +8,6 @@ import { PokerRoomManager } from "./rooms/PokerRoomManager";
 import { BlackjackRoomManager } from "./rooms/BlackjackRoomManager";
 import { TournamentDirector } from "./tournaments/TournamentDirector";
 
-
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
 
 // Admin key (required for admin-delete-room OR bj-delete-room with adminKey)
@@ -48,6 +47,42 @@ const pokerRooms = new Map<string, RoomMeta<PokerRoomManager>>();
 const blackjackRooms = new Map<string, RoomMeta<BlackjackRoomManager>>();
 const tournaments = new TournamentDirector();
 
+/**
+ * ✅ Track tournament lobby sockets so all registered players receive
+ * `tournament-start-result` and can auto-route to their assigned table.
+ *
+ * tournamentId -> (playerId -> socket)
+ */
+const tournamentSockets = new Map<string, Map<string, WebSocket>>();
+
+function trackTournamentSocket(
+  tournamentId: string,
+  playerId: string,
+  socket: WebSocket
+) {
+  if (!tournamentId || !playerId) return;
+  let byPlayer = tournamentSockets.get(tournamentId);
+  if (!byPlayer) {
+    byPlayer = new Map();
+    tournamentSockets.set(tournamentId, byPlayer);
+  }
+  byPlayer.set(playerId, socket);
+}
+
+function untrackSocket(socket: WebSocket) {
+  for (const [tid, byPlayer] of tournamentSockets.entries()) {
+    for (const [pid, s] of byPlayer.entries()) {
+      if (s === socket) byPlayer.delete(pid);
+    }
+    if (byPlayer.size === 0) tournamentSockets.delete(tid);
+  }
+}
+
+function broadcastTournament(tournamentId: string, payload: any) {
+  const byPlayer = tournamentSockets.get(tournamentId);
+  if (!byPlayer) return;
+  for (const s of byPlayer.values()) safeSend(s, payload);
+}
 
 function touchRoom(kind: GameKind, roomId: string) {
   const now = Date.now();
@@ -61,7 +96,7 @@ function touchRoom(kind: GameKind, roomId: string) {
 }
 
 function isTournamentRoomId(roomId: string) {
-  return String(roomId).startsWith("tourn-"); // matches TournamentDirector ids
+  return String(roomId).startsWith("tourn-"); // matches TournamentDirector tableRoomId ids
 }
 
 function getPokerRoom(roomId: string): PokerRoomManager {
@@ -78,6 +113,29 @@ function getPokerRoom(roomId: string): PokerRoomManager {
   return meta.room;
 }
 
+function isTournamentTableRoomId(roomId: string) {
+  const id = String(roomId || "");
+  // TournamentDirector tables are `${tournId}-t${n}`
+  return id.startsWith("tourn-") && /-t\d+$/.test(id);
+}
+
+
+// ✅ Force-create with explicit mode (used for assigned tableRoomId)
+function getPokerRoomWithMode(
+  roomId: string,
+  mode: "cash" | "tournament"
+): PokerRoomManager {
+  let meta = pokerRooms.get(roomId);
+  if (!meta) {
+    const room = new PokerRoomManager(roomId, { mode });
+    meta = { room, lastActiveAt: Date.now() };
+    pokerRooms.set(roomId, meta);
+  } else {
+    meta.lastActiveAt = Date.now();
+    // NOTE: we do NOT hot-switch existing room mode.
+  }
+  return meta.room;
+}
 
 function getBlackjackRoom(roomId: string): BlackjackRoomManager {
   let meta = blackjackRooms.get(roomId);
@@ -101,25 +159,15 @@ function safeSend(socket: WebSocket, payload: any) {
   }
 }
 
-function listPokerRooms() {
+function listPokerRoomsCash() {
   return Array.from(pokerRooms.entries())
     .map(([roomId, m]) => {
       const r: any = m.room as any;
 
-      // Prefer standardized snapshot if your room has it
       let snap: any = null;
       if (typeof r.getSnapshot === "function") snap = r.getSnapshot();
-      else if (typeof r.getLobbySummary === "function") snap = r.getLobbySummary();
-      else if (typeof r.getLobbySnapshot === "function") snap = r.getLobbySnapshot();
-      else {
-        snap = {
-          roomId,
-          onlineCount: r.clients?.size ?? 0,
-          seatedCount: 0,
-        };
-      }
+      else snap = { roomId, onlineCount: r.clients?.size ?? 0, seatedCount: 0 };
 
-      // ✅ Coordinator-known fields for cross-device lobby display
       return {
         ...snap,
         roomId: snap.roomId ?? roomId,
@@ -127,12 +175,41 @@ function listPokerRooms() {
         isPrivate: Boolean(m.isPrivate),
       };
     })
-    .filter((x) => x?.roomId && !String(x.roomId).startsWith("__"))
-    .sort(
-      (a, b) =>
-        (b.seatedCount - a.seatedCount) || (b.onlineCount - a.onlineCount)
-    );
+    .filter((x) => {
+      const id = String(x?.roomId ?? "");
+      if (!id || id.startsWith("__")) return false;
+      // ✅ cash = NOT tournament id and NOT tournament table
+      if (id.startsWith("tourn-")) return false;
+      return true;
+    })
+    .sort((a, b) => (b.seatedCount - a.seatedCount) || (b.onlineCount - a.onlineCount));
 }
+
+function listPokerRoomsTournamentTables() {
+  return Array.from(pokerRooms.entries())
+    .map(([roomId, m]) => {
+      const r: any = m.room as any;
+
+      let snap: any = null;
+      if (typeof r.getSnapshot === "function") snap = r.getSnapshot();
+      else snap = { roomId, onlineCount: r.clients?.size ?? 0, seatedCount: 0 };
+
+      return {
+        ...snap,
+        roomId: snap.roomId ?? roomId,
+        tableName: m.tableName ?? null,
+        isPrivate: Boolean(m.isPrivate),
+      };
+    })
+    .filter((x) => {
+      const id = String(x?.roomId ?? "");
+      if (!id || id.startsWith("__")) return false;
+      // ✅ tournament tables only
+      return isTournamentTableRoomId(id);
+    })
+    .sort((a, b) => (b.seatedCount - a.seatedCount) || (b.onlineCount - a.onlineCount));
+}
+
 
 function listBlackjackRooms() {
   return Array.from(blackjackRooms.entries())
@@ -309,34 +386,41 @@ wss.on("connection", (socket: WebSocket) => {
     }
 
     const typed = msg as ClientToServerMessage;
+    const raw = msg as any; // ✅ avoids TS union narrowing for new message types
 
     // ✅ LOBBY: list rooms (no join required)
-    if (typed.type === "list-rooms") {
-      if (typed.kind === "poker") {
-        safeSend(socket, {
-          kind: "poker",
-          displayName: "Texas Gold Room",
-          type: "rooms-list",
-          rooms: listPokerRooms(),
-          blinds: "50/100",
-          game: "No Limit Texas Gold Hold'em",
-        });
-        return;
-      }
+if (typed.type === "list-rooms") {
+  if (typed.kind === "poker") {
+    const cashRooms = listPokerRoomsCash();
+    const tourneyTables = listPokerRoomsTournamentTables();
 
-      if (typed.kind === "blackjack") {
-        safeSend(socket, {
-          kind: "blackjack",
-          displayName: "Big Nugget 21",
-          type: "rooms-list",
-          rooms: listBlackjackRooms(),
-          game: "Big Nugget 21",
-        });
-        return;
-      }
+    safeSend(socket, {
+      kind: "poker",
+      displayName: "Texas Gold Room",
+      type: "rooms-list",
+      rooms: cashRooms,                 // ✅ cash only
+      tournamentTables: tourneyTables,  // ✅ tournament tables only
+      blinds: "50/100",
+      game: "No Limit Texas Gold Hold'em",
+    });
 
-      return;
-    }
+    return;
+  }
+
+  if (typed.kind === "blackjack") {
+    safeSend(socket, {
+      kind: "blackjack",
+      displayName: "Blackjack",
+      type: "rooms-list",
+      rooms: listBlackjackRooms(),
+    });
+    return;
+  }
+}
+
+
+
+
 
     // ✅ BLACKJACK: create room (no join required)
     if (typed.kind === "blackjack" && typed.type === "bj-create-room") {
@@ -351,7 +435,9 @@ wss.on("connection", (socket: WebSocket) => {
         return;
       }
 
-      const incomingName = String((typed as any).tableName ?? "").trim().slice(0, 48);
+      const incomingName = String((typed as any).tableName ?? "")
+        .trim()
+        .slice(0, 48);
       const incomingPrivate =
         String((typed as any).private ?? "").trim() === "1" ||
         Boolean((typed as any).isPrivate);
@@ -364,7 +450,7 @@ wss.on("connection", (socket: WebSocket) => {
       const roomId = makeBjRoomId(minBet, maxBet);
 
       // Create room + meta
-      const room = getBlackjackRoom(roomId);
+      getBlackjackRoom(roomId);
       const meta = blackjackRooms.get(roomId);
       if (meta) {
         meta.hostPlayerId = playerId;
@@ -375,7 +461,6 @@ wss.on("connection", (socket: WebSocket) => {
         meta.lastActiveAt = Date.now();
       }
 
-      // respond to creator with created id
       safeSend(socket, {
         kind: "blackjack",
         type: "bj-room-created",
@@ -429,7 +514,9 @@ wss.on("connection", (socket: WebSocket) => {
       }
 
       try {
-        meta.room.shutdown(isAdmin ? "Room deleted by admin" : "Room deleted by host");
+        meta.room.shutdown(
+          isAdmin ? "Room deleted by admin" : "Room deleted by host"
+        );
       } catch {}
 
       blackjackRooms.delete(roomId);
@@ -485,7 +572,8 @@ wss.on("connection", (socket: WebSocket) => {
         }
 
         try {
-          if (typeof r.shutdown === "function") r.shutdown("Room closed by host");
+          if (typeof r.shutdown === "function")
+            r.shutdown("Room closed by host");
         } catch {}
 
         pokerRooms.delete(roomId);
@@ -509,89 +597,222 @@ wss.on("connection", (socket: WebSocket) => {
     }
 
     // ✅ TOURNAMENT: create (no join required)
-if (typed.kind === "poker" && typed.type === "tournament-create") {
-  const playerId = String((typed as any).playerId ?? "").trim();
-  if (!playerId) {
-    safeSend(socket, { kind:"poker", type:"tournament-created", ok:false, error:"Missing playerId" });
+    if (raw.kind === "poker" && raw.type === "tournament-create") {
+      const playerId = String(raw.playerId ?? "").trim();
+      if (!playerId) {
+        safeSend(socket, {
+          kind: "poker",
+          type: "tournament-created",
+          ok: false,
+          error: "Missing playerId",
+        });
+        return;
+      }
+
+      const buyIn = Number(raw.buyIn ?? 0);
+      const startingStack = Number(raw.startingStack ?? 0);
+      const seatsPerTable = Number(raw.seatsPerTable ?? 9);
+      const isPrivate = Boolean(raw.isPrivate);
+      const minPlayers = Number(raw.minPlayers ?? 2);
+
+      if (
+        !Number.isFinite(buyIn) ||
+        buyIn <= 0 ||
+        !Number.isFinite(startingStack) ||
+        startingStack <= 0
+      ) {
+        safeSend(socket, {
+          kind: "poker",
+          type: "tournament-created",
+          ok: false,
+          error: "Invalid buyIn/startingStack",
+        });
+        return;
+      }
+
+      const { tournamentId } = tournaments.createTournament({
+        hostPlayerId: playerId,
+        tournamentName: String(raw.tournamentName ?? "Tournament"),
+        buyIn,
+        startingStack,
+        seatsPerTable,
+        isPrivate,
+        minPlayers,
+        maxTables: Number(raw.maxTables ?? 5),
+      } as any);
+
+      // auto-register creator
+      tournaments.registerPlayer(tournamentId, playerId);
+
+      // ✅ track creator socket for start routing
+      trackTournamentSocket(tournamentId, playerId, socket);
+
+      safeSend(socket, {
+        kind: "poker",
+        type: "tournament-created",
+        ok: true,
+        tournamentId,
+      });
+
+      return;
+    }
+
+    // ✅ TOURNAMENT: join (register only; no join-room required)
+    if (raw.kind === "poker" && raw.type === "tournament-join") {
+      const playerId = String(raw.playerId ?? "").trim();
+      const tournamentId = String(raw.tournamentId ?? "").trim();
+
+      if (!playerId || !tournamentId) {
+        safeSend(socket, {
+          kind: "poker",
+          type: "tournament-join-result",
+          ok: false,
+          tournamentId: tournamentId || "unknown",
+          error: "Missing playerId/tournamentId",
+        });
+        return;
+      }
+
+      const res = tournaments.registerPlayer(tournamentId, playerId);
+      if (!res.ok) {
+        safeSend(socket, {
+          kind: "poker",
+          type: "tournament-join-result",
+          ok: false,
+          tournamentId,
+          error: res.error,
+        });
+        return;
+      }
+
+      // ✅ track joiner socket for start routing
+      trackTournamentSocket(tournamentId, playerId, socket);
+
+      const cfg = tournaments.getTournamentConfig(tournamentId);
+
+      safeSend(socket, {
+        kind: "poker",
+        type: "tournament-join-result",
+        ok: true,
+        tournamentId,
+
+        // surface join outcome
+        registeredCount: (res as any).registeredCount ?? null,
+        waitlistedCount: (res as any).waitlistedCount ?? 0,
+        cap: (res as any).cap ?? null,
+        isRegistered: (res as any).isRegistered ?? true,
+        isWaitlisted: (res as any).isWaitlisted ?? false,
+
+        // keep config
+        config: cfg,
+      } as any);
+
+      return;
+    }
+
+    // ✅ TOURNAMENT: start (host only)
+    if (raw.kind === "poker" && raw.type === "tournament-start") {
+      const playerId = String(raw.playerId ?? "").trim();
+      const tournamentId = String(raw.tournamentId ?? "").trim();
+      if (!playerId || !tournamentId) return;
+
+      const res = tournaments.startTournament(tournamentId, playerId) as any;
+      if (!res.ok) {
+        safeSend(socket, {
+          kind: "poker",
+          type: "tournament-start-result",
+          ok: false,
+          tournamentId,
+          error: res.error,
+        });
+        return;
+      }
+
+      const cfg = tournaments.getTournamentConfig(tournamentId);
+      const assignments = (res.assignments ?? []) as Array<{
+        tableRoomId: string;
+        players: string[];
+      }>;
+
+      // ✅ ensure all rooms exist + set config + allowlist
+      for (const a of assignments) {
+        const room = getPokerRoomWithMode(a.tableRoomId, "tournament");
+        (room as any).setTournamentConfig?.(cfg);
+        (room as any).setTournamentAllowList?.(a.players);
+        // NOTE: do NOT call autoSeatTournamentPlayers unless you implemented it in PokerRoomManager.
+      }
+
+      const payload = {
+        kind: "poker",
+        type: "tournament-start-result",
+        ok: true,
+        tournamentId,
+        assignments,
+        config: cfg,
+      } as any;
+
+      // ✅ send to starter + broadcast to all registered sockets
+      safeSend(socket, payload);
+      broadcastTournament(tournamentId, payload);
+
+      return;
+    }
+
+    // ✅ TOURNAMENT: list (for tournament lobby page)
+    if (raw.kind === "poker" && raw.type === "tournament-list") {
+      safeSend(socket, {
+        kind: "poker",
+        type: "tournament-list-result",
+        tournaments: tournaments.listTournaments(),
+      } as any);
+      return;
+    }
+
+    // ✅ POKER: create room (no join required)
+// ✅ POKER: create room (no join required)
+if (typed.kind === "poker" && typed.type === "poker-create-room") {
+  const roomId = String((typed as any).roomId ?? "").trim();
+  const tableName = String((typed as any).tableName ?? "").trim().slice(0, 48);
+  const incomingPrivate =
+    String((typed as any).private ?? "").trim() === "1" ||
+    Boolean((typed as any).isPrivate);
+
+  if (!roomId) {
+    safeSend(socket, {
+      kind: "poker",
+      type: "poker-create-room-result",
+      ok: false,
+      error: "Missing roomId",
+    });
     return;
   }
 
-  const buyIn = Number((typed as any).buyIn ?? 0);
-  const startingStack = Number((typed as any).startingStack ?? 0);
-  const seatsPerTable = Number((typed as any).seatsPerTable ?? 9);
-  const isPrivate = Boolean((typed as any).isPrivate);
+  const inferredMode: "cash" | "tournament" = isTournamentTableRoomId(roomId)
+    ? "tournament"
+    : "cash";
 
-  if (!Number.isFinite(buyIn) || buyIn <= 0 || !Number.isFinite(startingStack) || startingStack <= 0) {
-    safeSend(socket, { kind:"poker", type:"tournament-created", ok:false, error:"Invalid buyIn/startingStack" });
-    return;
+  // force create
+  getPokerRoomWithMode(roomId, inferredMode);
+
+  const meta = pokerRooms.get(roomId);
+  if (meta) {
+    meta.tableName = tableName || meta.tableName || "Gold Table";
+    meta.isPrivate = incomingPrivate;
+    meta.lastActiveAt = Date.now();
   }
-
-  const { tournamentId, firstTableRoomId } = tournaments.createTournament({
-    tournamentName: String((typed as any).tournamentName ?? "Tournament"),
-    buyIn,
-    startingStack,
-    seatsPerTable,
-    isPrivate,
-  });
-
-  // Ensure the first table room exists in coordinator map
-  getPokerRoom(firstTableRoomId);
-
-  // Auto-assign creator into the tournament (table selection)
-  const joinRes = tournaments.joinTournament(tournamentId, playerId);
 
   safeSend(socket, {
     kind: "poker",
-    type: "tournament-created",
+    type: "poker-create-room-result",
     ok: true,
-    tournamentId,
-    tableRoomId: joinRes.tableRoomId ?? firstTableRoomId,
+    roomId,
+    tableName: meta?.tableName ?? null,
+    isPrivate: Boolean(meta?.isPrivate),
   });
 
   return;
 }
 
-// ✅ TOURNAMENT: join (no join required)
-if (typed.kind === "poker" && typed.type === "tournament-join") {
-  const playerId = String((typed as any).playerId ?? "").trim();
-  const tournamentId = String((typed as any).tournamentId ?? "").trim();
-
-  if (!playerId || !tournamentId) {
-    safeSend(socket, {
-      kind: "poker",
-      type: "tournament-join-result",
-      ok: false,
-      tournamentId: tournamentId || "unknown",
-      error: "Missing playerId/tournamentId",
-    });
-    return;
-  }
-
-  const res = tournaments.joinTournament(tournamentId, playerId);
-  if (!res.ok || !res.tableRoomId) {
-    safeSend(socket, {
-      kind: "poker",
-      type: "tournament-join-result",
-      ok: false,
-      tournamentId,
-      error: res.error || "Join failed",
-    });
-    return;
-  }
-
-  // Ensure table exists
-  getPokerRoom(res.tableRoomId);
-
-  safeSend(socket, {
-    kind: "poker",
-    type: "tournament-join-result",
-    ok: true,
-    tournamentId,
-    tableRoomId: res.tableRoomId,
-  });
-
-  return;
-}
 
 
     // JOIN ROOM
@@ -610,9 +831,11 @@ if (typed.kind === "poker" && typed.type === "tournament-join") {
       touchRoom(kind, roomId);
 
       if (kind === "poker") {
-        // ✅ Capture tableName/private from the join message (first joiner sets it)
+        // Capture tableName/private from the join message (first joiner sets it)
         const meta = pokerRooms.get(roomId);
-        const incomingName = String((typed as any).tableName ?? (typed as any).name ?? "").trim();
+        const incomingName = String(
+          (typed as any).tableName ?? (typed as any).name ?? ""
+        ).trim();
         const incomingPrivate =
           String((typed as any).private ?? "").trim() === "1" ||
           Boolean((typed as any).isPrivate);
@@ -631,16 +854,18 @@ if (typed.kind === "poker" && typed.type === "tournament-join") {
           if (incomingPrivate) ensured.isPrivate = true;
         }
 
-        (room as any).addClient(playerId, socket, (typed as any).name);
+        (room as any).addClient(playerId, socket, (typed as any).name, {
+          tableName: (typed as any).tableName,
+          private: (typed as any).private ?? (typed as any).isPrivate,
+        });
       } else if (kind === "blackjack") {
-        // ✅ if someone joins a BJ room that exists, we still keep host/tableName
-        const meta = blackjackRooms.get(roomId);
-        const incomingName = String((typed as any).tableName ?? (typed as any).name ?? "").trim();
+        const incomingName = String(
+          (typed as any).tableName ?? (typed as any).name ?? ""
+        ).trim();
         const incomingPrivate =
           String((typed as any).private ?? "").trim() === "1" ||
           Boolean((typed as any).isPrivate);
 
-        // Create room if absent
         const room = getBlackjackRoom(roomId);
 
         // Ensure meta exists & set host if missing (first joiner becomes host)
@@ -692,6 +917,9 @@ if (typed.kind === "poker" && typed.type === "tournament-join") {
 
   socket.on("close", () => {
     console.log("[Coordinator] Client disconnected");
+
+    // ✅ remove socket from tournament tracking
+    untrackSocket(socket);
 
     if (heartbeatTimer) {
       clearInterval(heartbeatTimer);

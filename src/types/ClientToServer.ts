@@ -24,11 +24,16 @@ export type ClientToServerType =
   | "start-hand" // legacy alias for "start-game"
   | "start-game"
   | "refill-stack"
+  | "demo-topup"
   | "close-room"
+  
 
-  // ✅ tournaments (coordinator-level)
+    // ✅ tournaments (coordinator-level)
   | "tournament-create"
   | "tournament-join"
+  | "tournament-start"
+  | "tournament-list"
+
 
   // blackjack
   | "bj-seat"
@@ -83,6 +88,16 @@ export type ClientToServerPayloadMap = {
     tournamentId: string;
     name?: string;          // display name
   };
+
+    "tournament-start": {
+    playerId: string;
+    tournamentId: string;
+  };
+
+  "tournament-list": {
+    // optional filters later (private/public, etc.)
+  };
+
 
   // ── Blackjack
   "bj-seat": { action: "sit" | "leave"; seatIndex: number; name?: string };

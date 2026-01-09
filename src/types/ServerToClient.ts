@@ -27,9 +27,12 @@ export type ServerToClientType =
   | "player-show-cards"
   | "game-status"
 
-    // ✅ tournaments
+      // ✅ tournaments
   | "tournament-created"
   | "tournament-join-result"
+  | "tournament-start-result"
+  | "tournament-list-result"
+
 
   // blackjack (legacy labels allowed)
   | "blackjack-state"
@@ -67,19 +70,44 @@ export type ServerToClientPayloadMap = {
    "game-status": { started: boolean; handInProgress: boolean };
 
     // ✅ tournaments
-  "tournament-created": {
+   "tournament-created": {
     ok: boolean;
     tournamentId?: string;
-    tableRoomId?: string;
     error?: string;
   };
 
   "tournament-join-result": {
     ok: boolean;
     tournamentId: string;
-    tableRoomId?: string;
+    registeredCount?: number;
+    config?: TournamentConfig | null;
     error?: string;
   };
+
+  "tournament-start-result": {
+    ok: boolean;
+    tournamentId: string;
+    assignments?: Array<{ tableRoomId: string; players: string[] }>;
+    config?: TournamentConfig | null;
+    error?: string;
+  };
+
+  "tournament-list-result": {
+    tournaments: Array<{
+      tournamentId: string;
+      tournamentName: string;
+      buyIn: number;
+      startingStack: number;
+      seatsPerTable: number;
+      isPrivate: boolean;
+      status: "waiting" | "running" | "finished";
+      minPlayers: number;
+      registeredCount: number;
+      hostPlayerId: string;
+      createdAt: number;
+    }>;
+  };
+
 
   // Blackjack lobby create/delete helpers
   "bj-room-created": { roomId: string };
@@ -94,6 +122,22 @@ export type PokerPlayerShowCards = MessageBase & {
   cards: string[];
   reason?: "all-in" | "voluntary";
 };
+
+export type TournamentConfig = {
+  tournamentId: string;
+  tournamentName: string;
+  buyIn: number;
+  startingStack: number;
+  seatsPerTable: number;
+  isPrivate: boolean;
+
+  status: "waiting" | "running" | "finished";
+  minPlayers: number;
+  maxTables: number;
+  hostPlayerId: string;
+  registeredCount: number;
+};
+
 
 export type ServerToClientMessage = MessageBase & {
   type: ServerToClientType;
