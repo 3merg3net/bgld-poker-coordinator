@@ -134,10 +134,61 @@ private forceEndHand(reason: string) {
   if (eligible.length >= 2 && this.clients.size > 0) this.armAutoDeal();
 }
 
-// hold the NEXT deal (never freezes action mid-hand)
+// WSOP-style: HOLD NEXT DEAL (never freezes action mid-hand)
 private dealHeld = false;
-private dealHeldBy: string | null = null; // playerId
-private dealHeldAt: number | null = null; // Date.now()
+private dealHeldBy: string | null = null;
+private dealHeldAt: number | null = null;
+
+private broadcastDealHoldState() {
+  this.broadcast({
+    kind: "poker",
+    roomId: this.roomId,
+    playerId: "server",
+    type: "deal-hold-state",
+    held: this.dealHeld,
+    heldBy: this.dealHeldBy,
+    heldAt: this.dealHeldAt,
+  } as any);
+}
+
+private setDealHeld(byPlayerId: string) {
+  this.dealHeld = true;
+  this.dealHeldBy = byPlayerId;
+  this.dealHeldAt = Date.now();
+
+  this.broadcast({
+    kind: "poker",
+    roomId: this.roomId,
+    playerId: "server",
+    type: "chat-broadcast",
+    text: "⏸ Dealing is ON HOLD (next hand will not start).",
+  } as any);
+
+  this.broadcastDealHoldState();
+}
+
+private setDealResumed(byPlayerId: string) {
+  this.dealHeld = false;
+  this.dealHeldBy = null;
+  this.dealHeldAt = null;
+
+  this.broadcast({
+    kind: "poker",
+    roomId: this.roomId,
+    playerId: "server",
+    type: "chat-broadcast",
+    text: "▶ Dealing resumed.",
+  } as any);
+
+  this.broadcastDealHoldState();
+
+  // If no hand in progress, re-arm autodeal
+  if (!this.handInProgress) {
+    const eligible = this.seats.filter((s) => s.playerId && (s.chips ?? 0) > 0);
+    if (eligible.length >= 2 && this.clients.size > 0) this.armAutoDeal();
+  }
+}
+
 
 
 
@@ -600,11 +651,12 @@ this.sendTo(playerId, {
   kind: "poker",
   roomId: this.roomId,
   playerId: "server",
-  type: "pause-state",
-  paused: this.paused,
-  pauseUntil: this.pauseUntil,
-  pausedBy: this.pausedBy,
+  type: "deal-hold-state",
+  held: this.dealHeld,
+  heldBy: this.dealHeldBy,
+  heldAt: this.dealHeldAt,
 } as any);
+
 
   }
 
@@ -680,16 +732,20 @@ this.sendTo(playerId, {
 
     const t = (msg as any).type as string;
 
-// host commands allowed during pause
 const isHostCmd =
-  t === "host-pause" ||
-  t === "host-resume" ||
+  t === "host-hold-deal" ||
+  t === "host-resume-deal" ||
   t === "host-reset" ||
   t === "host-force-end-hand" ||
   t === "ping" ||
   t === "chat" ||
-  t === "sit" ||          // ✅ allow seating during pause
-  t === "stand";          // ✅ allow standing during pause
+  t === "sit" ||
+  t === "stand";
+
+// NOTE: we do NOT block actions mid-hand anymore via "pause".
+// If you still want your old paused system, keep it separate.
+// WSOP-style is: never freeze action, only hold next deal.
+
 
 
 // ✅ Block gameplay commands while paused (everyone sees it frozen)
@@ -763,17 +819,20 @@ if (this.paused && !isHostCmd) {
         this.handleStartHand(playerId);
         return;
 
-        case "host-pause": {
+        case "host-hold-deal": {
   if (!this.isHost(playerId)) return;
-  this.setPaused(playerId, Number((msg as any).seconds ?? 30));
+  this.setDealHeld(playerId);
   return;
 }
 
-case "host-resume": {
+case "host-resume-deal": {
   if (!this.isHost(playerId)) return;
-  this.setResumed(playerId);
+  this.setDealResumed(playerId);
   return;
 }
+
+
+
 
 case "host-reset": {
   if (!this.isHost(playerId)) return;
@@ -1225,6 +1284,34 @@ case "host-force-end-hand": {
       return false;
     }
 
+    // WSOP-style: if dealing is held, do NOT start the next hand
+if (this.dealHeld) {
+  if (!auto && requesterId) {
+    this.sendTo(requesterId, {
+      kind: "poker",
+      roomId: this.roomId,
+      playerId: "server",
+      type: "toast",
+      message: "Dealing is on hold (next hand).",
+    } as any);
+  }
+
+  // keep the table informed
+  this.broadcastDealHoldState();
+
+  // keep attempting later (so when host resumes it naturally starts)
+  if (this.clients.size > 0) {
+    this.clearAutoDealTimer();
+    this.autoDealTimer = setTimeout(() => {
+      if (this.clients.size === 0) return;
+      this.tryStartHand(true);
+    }, 2_000) as any;
+  }
+
+  return false;
+}
+
+
     this.cleanupGhostSeats();
 
     const seatedPlayers = this.seats.filter(
@@ -1535,6 +1622,9 @@ if (!betting) return;
   this.clients.clear();
   this.resetTableState();
 }
+
+private dealingHeld = false;         // "Hold dealing" active
+private holdUntilMs: number | null = null; // optional timed hold
 
 
   // ─────────────────────────────────────────────────────────────
