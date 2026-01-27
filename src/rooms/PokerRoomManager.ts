@@ -952,6 +952,16 @@ case "host-force-end-hand": {
   handle?: string // ✅ ADD
 ) {
 
+  console.log(`[PokerRoom:${this.roomId}] handleSit`, {
+  playerId,
+  buyIn,
+  seatIndex,
+  mode: this.mode,
+  clients: this.clients.size,
+  seated: this.seats.filter(s => s.playerId).length,
+})
+
+
   const already = this.seats.find((s) => s.playerId === playerId);
   if (already) return;
 
@@ -1029,6 +1039,12 @@ const safeName = String(name ?? "").trim() || undefined;
         : s
     );
 
+    console.log(`[PokerRoom:${this.roomId}] seated OK`, {
+  playerId,
+  seat: targetSeat?.seatIndex,
+})
+
+
     this.syncGameWithSeats("tournament-sit");
     await this.broadcastSeats();
 
@@ -1082,6 +1098,12 @@ const safeName = String(name ?? "").trim() || undefined;
 
       : s
   );
+
+  console.log(`[PokerRoom:${this.roomId}] seated OK`, {
+  playerId,
+  seat: targetSeat?.seatIndex,
+})
+
 
   this.syncGameWithSeats("cash-sit");
   await this.broadcastSeats();
