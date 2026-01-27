@@ -61,7 +61,7 @@ export type ClientToServerPayloadMap = {
   chat: { text: string };
 
   // ── Poker
-  sit: { buyIn?: number; seatIndex?: number; name?: string };
+  sit: { buyIn?: number; seatIndex?: number; name?: string; handle?: string };
   stand: Record<string, never>;
   action: { action: "fold" | "check" | "call" | "bet"; amount?: number };
   "show-cards": Record<string, never>;

@@ -258,11 +258,13 @@ private mode: "cash" | "tournament" = "cash";
 
     for (let i = 0; i < 9; i++) {
       this.seats.push({
-        seatIndex: i,
-        playerId: null,
-        name: undefined,
-        chips: 0,
-      });
+  seatIndex: i,
+  playerId: null,
+  handle: undefined, // ✅ ADD
+  name: undefined,
+  chips: 0,
+});
+
     }
   }
 private tournamentConfig: null | {
@@ -782,13 +784,15 @@ if (this.paused && !isHostCmd) {
         return;
 
       case "sit":
-        void this.handleSit(
-          playerId,
-          (msg as any).buyIn,
-          (msg as any).seatIndex,
-          (msg as any).name
-        );
-        return;
+  void this.handleSit(
+    playerId,
+    (msg as any).buyIn,
+    (msg as any).seatIndex,
+    (msg as any).name,
+    (msg as any).handle // ✅ ADD
+  );
+  return;
+
 
       case "stand":
         void this.handleStand(playerId);
@@ -944,10 +948,17 @@ case "host-force-end-hand": {
   playerId: string,
   buyIn?: number,
   seatIndex?: number,
-  name?: string
+  name?: string,
+  handle?: string // ✅ ADD
 ) {
+
   const already = this.seats.find((s) => s.playerId === playerId);
   if (already) return;
+
+  const h = String(handle ?? "").trim();
+const safeHandle = h ? (h.startsWith("@") ? h : `@${h}`) : undefined;
+const safeName = String(name ?? "").trim() || undefined;
+
 
   // ✅ tournament allowlist enforcement
   if (this.mode === "tournament" && this.tournamentAllowList) {
@@ -1007,7 +1018,14 @@ case "host-force-end-hand": {
 
     this.seats = this.seats.map((s) =>
       s.seatIndex === targetSeat!.seatIndex
-        ? { ...s, playerId, name: name || this.clients.get(playerId)?.name, chips: stack }
+        ? {
+    ...s,
+    playerId,
+    handle: safeHandle, // ✅ store handle
+    name: safeName || this.clients.get(playerId)?.name,
+    chips: stack,
+  }
+
         : s
     );
 
@@ -1054,7 +1072,14 @@ case "host-force-end-hand": {
 
   this.seats = this.seats.map((s) =>
     s.seatIndex === targetSeat!.seatIndex
-      ? { ...s, playerId, name: name || this.clients.get(playerId)?.name, chips: desired }
+      ? {
+    ...s,
+    playerId,
+    handle: safeHandle, // ✅ store handle
+    name: safeName || this.clients.get(playerId)?.name,
+    chips: desired,
+  }
+
       : s
   );
 
@@ -1551,7 +1576,7 @@ if (!betting) return;
     this.seats = this.seats.map((s) => {
       if (s.playerId && !activeIds.has(s.playerId)) {
         changed = true;
-        return { ...s, playerId: null, name: undefined, chips: 0 };
+        return { ...s, playerId: null, handle: undefined, name: undefined, chips: 0 };
       }
       return s;
     });
@@ -1569,12 +1594,14 @@ if (!betting) return;
 
     const freshSeats: SeatView[] = [];
     for (let i = 0; i < 9; i++) {
-      freshSeats.push({
-        seatIndex: i,
-        playerId: null,
-        name: undefined,
-        chips: 0,
-      });
+      this.seats.push({
+  seatIndex: i,
+  playerId: null,
+  handle: undefined, // ✅ ADD
+  name: undefined,
+  chips: 0,
+});
+
     }
 
     this.seats = freshSeats;

@@ -10,9 +10,11 @@
 export type SeatView = {
   seatIndex: number;
   playerId: string | null;
+  handle?: string; // ✅ ADD
   name?: string;
-  chips: number;
+  chips?: number;
 };
+
 
 // Table state broadcast (legacy cash UI uses this)
 export type TablePlayerState = {

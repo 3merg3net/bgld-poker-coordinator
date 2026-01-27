@@ -58,15 +58,17 @@ export type ServerToClientPayloadMap = {
   };
 
   // Poker
-  "seats-update": {
-    seats: Array<{
-      seatIndex: number;
-      playerId: string | null;
-      name?: string;
-      chips?: number;
-    }>;
-    bankrolls?: Record<string, number>;
-  };
+"seats-update": {
+  seats: Array<{
+    seatIndex: number;
+    playerId: string | null;
+    handle?: string; // ✅ add
+    name?: string;
+    chips?: number;
+  }>;
+  bankrolls?: Record<string, number>;
+}
+
    "game-status": { started: boolean; handInProgress: boolean };
 
     // ✅ tournaments
