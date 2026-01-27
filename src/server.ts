@@ -119,7 +119,6 @@ function isTournamentTableRoomId(roomId: string) {
   return id.startsWith("tourn-") && /-t\d+$/.test(id);
 }
 
-
 // ✅ Force-create with explicit mode (used for assigned tableRoomId)
 function getPokerRoomWithMode(
   roomId: string,
@@ -182,7 +181,10 @@ function listPokerRoomsCash() {
       if (id.startsWith("tourn-")) return false;
       return true;
     })
-    .sort((a, b) => (b.seatedCount - a.seatedCount) || (b.onlineCount - a.onlineCount));
+    .sort(
+      (a, b) =>
+        b.seatedCount - a.seatedCount || b.onlineCount - a.onlineCount
+    );
 }
 
 function listPokerRoomsTournamentTables() {
@@ -207,9 +209,11 @@ function listPokerRoomsTournamentTables() {
       // ✅ tournament tables only
       return isTournamentTableRoomId(id);
     })
-    .sort((a, b) => (b.seatedCount - a.seatedCount) || (b.onlineCount - a.onlineCount));
+    .sort(
+      (a, b) =>
+        b.seatedCount - a.seatedCount || b.onlineCount - a.onlineCount
+    );
 }
-
 
 function listBlackjackRooms() {
   return Array.from(blackjackRooms.entries())
@@ -228,7 +232,7 @@ function listBlackjackRooms() {
     .filter((x) => x?.roomId && !String(x.roomId).startsWith("__"))
     .sort(
       (a, b) =>
-        (b.seatedCount - a.seatedCount) || (b.onlineCount - a.onlineCount)
+        b.seatedCount - a.seatedCount || b.onlineCount - a.onlineCount
     );
 }
 
@@ -239,7 +243,8 @@ function adminDeleteRoom(kind: GameKind, roomId: string) {
     if (!meta) return { ok: false, error: "Poker room not found" };
     const r: any = meta.room as any;
     try {
-      if (typeof r.shutdown === "function") r.shutdown("Room deleted by admin");
+      if (typeof r.shutdown === "function")
+        r.shutdown("Room deleted by admin");
     } catch {}
     pokerRooms.delete(roomId);
     return { ok: true };
@@ -389,38 +394,34 @@ wss.on("connection", (socket: WebSocket) => {
     const raw = msg as any; // ✅ avoids TS union narrowing for new message types
 
     // ✅ LOBBY: list rooms (no join required)
-if (typed.type === "list-rooms") {
-  if (typed.kind === "poker") {
-    const cashRooms = listPokerRoomsCash();
-    const tourneyTables = listPokerRoomsTournamentTables();
+    if (typed.type === "list-rooms") {
+      if (typed.kind === "poker") {
+        const cashRooms = listPokerRoomsCash();
+        const tourneyTables = listPokerRoomsTournamentTables();
 
-    safeSend(socket, {
-      kind: "poker",
-      displayName: "Texas Gold Room",
-      type: "rooms-list",
-      rooms: cashRooms,                 // ✅ cash only
-      tournamentTables: tourneyTables,  // ✅ tournament tables only
-      blinds: "50/100",
-      game: "No Limit Texas Gold Hold'em",
-    });
+        safeSend(socket, {
+          kind: "poker",
+          displayName: "Texas Gold Room",
+          type: "rooms-list",
+          rooms: cashRooms, // ✅ cash only
+          tournamentTables: tourneyTables, // ✅ tournament tables only
+          blinds: "50/100",
+          game: "No Limit Texas Gold Hold'em",
+        });
 
-    return;
-  }
+        return;
+      }
 
-  if (typed.kind === "blackjack") {
-    safeSend(socket, {
-      kind: "blackjack",
-      displayName: "Blackjack",
-      type: "rooms-list",
-      rooms: listBlackjackRooms(),
-    });
-    return;
-  }
-}
-
-
-
-
+      if (typed.kind === "blackjack") {
+        safeSend(socket, {
+          kind: "blackjack",
+          displayName: "Blackjack",
+          type: "rooms-list",
+          rooms: listBlackjackRooms(),
+        });
+        return;
+      }
+    }
 
     // ✅ BLACKJACK: create room (no join required)
     if (typed.kind === "blackjack" && typed.type === "bj-create-room") {
@@ -769,53 +770,52 @@ if (typed.type === "list-rooms") {
     }
 
     // ✅ POKER: create room (no join required)
-// ✅ POKER: create room (no join required)
-if (typed.kind === "poker" && typed.type === "poker-create-room") {
-  const roomId = String((typed as any).roomId ?? "").trim();
-  const tableName = String((typed as any).tableName ?? "").trim().slice(0, 48);
-  const incomingPrivate =
-    String((typed as any).private ?? "").trim() === "1" ||
-    Boolean((typed as any).isPrivate);
+    if (typed.kind === "poker" && typed.type === "poker-create-room") {
+      const roomId = String((typed as any).roomId ?? "").trim();
+      const tableName = String((typed as any).tableName ?? "")
+        .trim()
+        .slice(0, 48);
+      const incomingPrivate =
+        String((typed as any).private ?? "").trim() === "1" ||
+        Boolean((typed as any).isPrivate);
 
-  if (!roomId) {
-    safeSend(socket, {
-      kind: "poker",
-      type: "poker-create-room-result",
-      ok: false,
-      error: "Missing roomId",
-    });
-    return;
-  }
+      if (!roomId) {
+        safeSend(socket, {
+          kind: "poker",
+          type: "poker-create-room-result",
+          ok: false,
+          error: "Missing roomId",
+        });
+        return;
+      }
 
-  const inferredMode: "cash" | "tournament" = isTournamentTableRoomId(roomId)
-    ? "tournament"
-    : "cash";
+      const inferredMode: "cash" | "tournament" = isTournamentTableRoomId(roomId)
+        ? "tournament"
+        : "cash";
 
-  // force create
-  getPokerRoomWithMode(roomId, inferredMode);
+      // force create
+      getPokerRoomWithMode(roomId, inferredMode);
 
-  const meta = pokerRooms.get(roomId);
-  if (meta) {
-    meta.tableName = tableName || meta.tableName || "Gold Table";
-    meta.isPrivate = incomingPrivate;
-    meta.lastActiveAt = Date.now();
-  }
+      const meta = pokerRooms.get(roomId);
+      if (meta) {
+        meta.tableName = tableName || meta.tableName || "Gold Table";
+        meta.isPrivate = incomingPrivate;
+        meta.lastActiveAt = Date.now();
+      }
 
-  safeSend(socket, {
-    kind: "poker",
-    type: "poker-create-room-result",
-    ok: true,
-    roomId,
-    tableName: meta?.tableName ?? null,
-    isPrivate: Boolean(meta?.isPrivate),
-  });
+      safeSend(socket, {
+        kind: "poker",
+        type: "poker-create-room-result",
+        ok: true,
+        roomId,
+        tableName: meta?.tableName ?? null,
+        isPrivate: Boolean(meta?.isPrivate),
+      });
 
-  return;
-}
+      return;
+    }
 
-
-
-    // JOIN ROOM
+    // JOIN ROOM (explicit)
     if (typed.type === "join-room") {
       const { roomId, playerId, kind } = typed as any;
 
@@ -889,16 +889,51 @@ if (typed.kind === "poker" && typed.type === "poker-create-room") {
       return;
     }
 
-    // Route everything else to the correct room
+    // ✅ AUTO-JOIN SAFETY NET (fixes "sit/demo-topup before join-room" on Railway)
     if (!currentRoomId || !currentPlayerId || !currentKind) {
-      console.warn("[Coordinator] Got message before join-room; ignoring:", typed);
-      return;
+      const kind = (typed as any).kind as GameKind | undefined;
+      const roomId = String((typed as any).roomId ?? "").trim();
+      const playerId = String((typed as any).playerId ?? "").trim();
+
+      // helpful log so you can confirm in Railway logs
+      console.warn("[Coordinator] PRE-JOIN DROP CHECK", {
+        type: (typed as any).type,
+        kind,
+        roomId,
+        playerId,
+      });
+
+      if ((kind === "poker" || kind === "blackjack") && roomId && playerId) {
+        console.log("[Coordinator] Auto-joining from first message", {
+          kind,
+          roomId,
+          playerId,
+        });
+
+        currentRoomId = roomId;
+        currentPlayerId = playerId;
+        currentKind = kind;
+
+        touchRoom(kind, roomId);
+
+        if (kind === "poker") {
+          const room = getPokerRoom(roomId);
+          (room as any).addClient(playerId, socket, (typed as any).name, {});
+        } else {
+          const room = getBlackjackRoom(roomId);
+          room.addClient(playerId, socket, (typed as any).name);
+        }
+      } else {
+        console.warn("[Coordinator] Got message before join-room; ignoring:", typed);
+        return;
+      }
     }
 
-    touchRoom(currentKind, currentRoomId);
+    // Route everything else to the correct room
+    touchRoom(currentKind!, currentRoomId!);
 
     if (currentKind === "poker") {
-      const meta = pokerRooms.get(currentRoomId);
+      const meta = pokerRooms.get(currentRoomId!);
       if (!meta) {
         console.warn("[Coordinator] No poker room found for", currentRoomId);
         return;
@@ -907,7 +942,7 @@ if (typed.kind === "poker" && typed.type === "poker-create-room") {
       return;
     }
 
-    const meta = blackjackRooms.get(currentRoomId);
+    const meta = blackjackRooms.get(currentRoomId!);
     if (!meta) {
       console.warn("[Coordinator] No blackjack room found for", currentRoomId);
       return;
