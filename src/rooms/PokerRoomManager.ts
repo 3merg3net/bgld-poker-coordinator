@@ -232,23 +232,40 @@ private setDealResumed(byPlayerId: string) {
   }
 
   private async safeDebit(playerId: string, amount: number, txType: string, ref?: any, meta?: any) {
-    const amt = Math.max(0, Math.floor(amount));
-    if (amt <= 0) return;
+  const amt = Math.max(0, Math.floor(amount));
+  if (amt <= 0) return;
 
-    try {
-      await debitPgld({ playerId, amount: amt, txType: txType as any, ref, meta });
-      return;
-    } catch (e: any) {
-      // fallback
-      const cur = this.getDemoBankroll(playerId);
-      if (cur < amt) {
-        const err: any = new Error("INSUFFICIENT_PGLD");
-        err.message = "INSUFFICIENT_PGLD";
-        throw err;
+  try {
+    await debitPgld({ playerId, amount: amt, txType: txType as any, ref, meta });
+    return;
+  } catch (e: any) {
+    // IMPORTANT: if Supabase write fails but reads work, seed demo from read
+    let cur = this.getDemoBankroll(playerId);
+
+    console.error("[PokerRoom] debitPgld failed (likely Supabase RLS/keys)", e);
+
+
+    if (cur <= 0) {
+      try {
+        const fromRead = await getPgld(playerId);
+        const seeded = Math.max(0, Math.floor(Number(fromRead) || 0));
+        this.setDemoBankroll(playerId, seeded);
+        cur = seeded;
+      } catch {
+        // leave cur as demo value
       }
-      this.setDemoBankroll(playerId, cur - amt);
     }
+
+    if (cur < amt) {
+      const err: any = new Error("INSUFFICIENT_PGLD");
+      err.message = "INSUFFICIENT_PGLD";
+      throw err;
+    }
+
+    this.setDemoBankroll(playerId, cur - amt);
   }
+}
+
 private mode: "cash" | "tournament" = "cash";
   
 
