@@ -84,6 +84,115 @@ function broadcastTournament(tournamentId: string, payload: any) {
   for (const s of byPlayer.values()) safeSend(s, payload);
 }
 
+/* ──────────────────────────────────────────────────────────────
+   Reconnect grace timers (Coordinator-side)
+   - Keeps seats on short disconnects (mobile background / wifi flips)
+   - Requires PokerRoomManager.removeClient(playerId, reason)
+     where reason "disconnect" keeps seat, and "timeout" clears/cashout.
+   ────────────────────────────────────────────────────────────── */
+
+const POKER_RECONNECT_GRACE_MS =
+  Number(process.env.POKER_RECONNECT_GRACE_MS ?? "") || 120_000; // 2 min
+const BJ_RECONNECT_GRACE_MS =
+  Number(process.env.BJ_RECONNECT_GRACE_MS ?? "") || 20_000; // optional
+
+// roomId -> playerId -> timeout handle
+const pokerDisconnectTimers = new Map<string, Map<string, NodeJS.Timeout>>();
+const bjDisconnectTimers = new Map<string, Map<string, NodeJS.Timeout>>();
+
+function scheduleDisconnectRemoval(
+  store: Map<string, Map<string, NodeJS.Timeout>>,
+  roomId: string,
+  playerId: string,
+  ms: number,
+  fn: () => void
+) {
+  if (!roomId || !playerId) return;
+
+  let perRoom = store.get(roomId);
+  if (!perRoom) {
+    perRoom = new Map();
+    store.set(roomId, perRoom);
+  }
+
+  const existing = perRoom.get(playerId);
+  if (existing) clearTimeout(existing);
+
+  const t = setTimeout(() => {
+    try {
+      fn();
+    } finally {
+      const pr = store.get(roomId);
+      pr?.delete(playerId);
+      if (pr && pr.size === 0) store.delete(roomId);
+    }
+  }, ms);
+
+  perRoom.set(playerId, t);
+}
+
+function cancelDisconnectRemoval(
+  store: Map<string, Map<string, NodeJS.Timeout>>,
+  roomId: string,
+  playerId: string
+) {
+  if (!roomId || !playerId) return;
+
+  const perRoom = store.get(roomId);
+  const t = perRoom?.get(playerId);
+  if (t) clearTimeout(t);
+
+  perRoom?.delete(playerId);
+  if (perRoom && perRoom.size === 0) store.delete(roomId);
+}
+
+function schedulePokerDisconnectRemoval(roomId: string, playerId: string) {
+  scheduleDisconnectRemoval(
+    pokerDisconnectTimers,
+    roomId,
+    playerId,
+    POKER_RECONNECT_GRACE_MS,
+    () => {
+      const meta = pokerRooms.get(roomId);
+      try {
+        // ✅ after grace expires: hard remove (clear seat + cashout)
+        (meta?.room as any)?.removeClient?.(playerId, "timeout");
+      } catch {}
+    }
+  );
+}
+
+function cancelPokerDisconnectRemoval(roomId: string, playerId: string) {
+  cancelDisconnectRemoval(pokerDisconnectTimers, roomId, playerId);
+}
+
+// optional: if you also want BJ to be forgiving on mobile
+function scheduleBjDisconnectRemoval(roomId: string, playerId: string) {
+  scheduleDisconnectRemoval(
+    bjDisconnectTimers,
+    roomId,
+    playerId,
+    BJ_RECONNECT_GRACE_MS,
+    () => {
+      const meta = blackjackRooms.get(roomId);
+      try {
+        // if your BJ supports reason, keep it; else it will be ignored
+        (meta?.room as any)?.removeClient?.(playerId, "timeout");
+      } catch {
+        try {
+          meta?.room?.removeClient?.(playerId);
+        } catch {}
+      }
+    }
+  );
+}
+
+function cancelBjDisconnectRemoval(roomId: string, playerId: string) {
+  cancelDisconnectRemoval(bjDisconnectTimers, roomId, playerId);
+}
+
+/* ────────────────────────────────────────────────────────────── */
+
 function touchRoom(kind: GameKind, roomId: string) {
   const now = Date.now();
   if (kind === "poker") {
@@ -181,10 +290,7 @@ function listPokerRoomsCash() {
       if (id.startsWith("tourn-")) return false;
       return true;
     })
-    .sort(
-      (a, b) =>
-        b.seatedCount - a.seatedCount || b.onlineCount - a.onlineCount
-    );
+    .sort((a, b) => b.seatedCount - a.seatedCount || b.onlineCount - a.onlineCount);
 }
 
 function listPokerRoomsTournamentTables() {
@@ -209,10 +315,7 @@ function listPokerRoomsTournamentTables() {
       // ✅ tournament tables only
       return isTournamentTableRoomId(id);
     })
-    .sort(
-      (a, b) =>
-        b.seatedCount - a.seatedCount || b.onlineCount - a.onlineCount
-    );
+    .sort((a, b) => b.seatedCount - a.seatedCount || b.onlineCount - a.onlineCount);
 }
 
 function listBlackjackRooms() {
@@ -230,10 +333,7 @@ function listBlackjackRooms() {
       };
     })
     .filter((x) => x?.roomId && !String(x.roomId).startsWith("__"))
-    .sort(
-      (a, b) =>
-        b.seatedCount - a.seatedCount || b.onlineCount - a.onlineCount
-    );
+    .sort((a, b) => b.seatedCount - a.seatedCount || b.onlineCount - a.onlineCount);
 }
 
 // Admin delete room (duck-typed shutdown)
@@ -243,8 +343,7 @@ function adminDeleteRoom(kind: GameKind, roomId: string) {
     if (!meta) return { ok: false, error: "Poker room not found" };
     const r: any = meta.room as any;
     try {
-      if (typeof r.shutdown === "function")
-        r.shutdown("Room deleted by admin");
+      if (typeof r.shutdown === "function") r.shutdown("Room deleted by admin");
     } catch {}
     pokerRooms.delete(roomId);
     return { ok: true };
@@ -436,9 +535,7 @@ wss.on("connection", (socket: WebSocket) => {
         return;
       }
 
-      const incomingName = String((typed as any).tableName ?? "")
-        .trim()
-        .slice(0, 48);
+      const incomingName = String((typed as any).tableName ?? "").trim().slice(0, 48);
       const incomingPrivate =
         String((typed as any).private ?? "").trim() === "1" ||
         Boolean((typed as any).isPrivate);
@@ -515,9 +612,7 @@ wss.on("connection", (socket: WebSocket) => {
       }
 
       try {
-        meta.room.shutdown(
-          isAdmin ? "Room deleted by admin" : "Room deleted by host"
-        );
+        meta.room.shutdown(isAdmin ? "Room deleted by admin" : "Room deleted by host");
       } catch {}
 
       blackjackRooms.delete(roomId);
@@ -573,8 +668,7 @@ wss.on("connection", (socket: WebSocket) => {
         }
 
         try {
-          if (typeof r.shutdown === "function")
-            r.shutdown("Room closed by host");
+          if (typeof r.shutdown === "function") r.shutdown("Room closed by host");
         } catch {}
 
         pokerRooms.delete(roomId);
@@ -740,7 +834,6 @@ wss.on("connection", (socket: WebSocket) => {
         const room = getPokerRoomWithMode(a.tableRoomId, "tournament");
         (room as any).setTournamentConfig?.(cfg);
         (room as any).setTournamentAllowList?.(a.players);
-        // NOTE: do NOT call autoSeatTournamentPlayers unless you implemented it in PokerRoomManager.
       }
 
       const payload = {
@@ -752,7 +845,6 @@ wss.on("connection", (socket: WebSocket) => {
         config: cfg,
       } as any;
 
-      // ✅ send to starter + broadcast to all registered sockets
       safeSend(socket, payload);
       broadcastTournament(tournamentId, payload);
 
@@ -772,9 +864,7 @@ wss.on("connection", (socket: WebSocket) => {
     // ✅ POKER: create room (no join required)
     if (typed.kind === "poker" && typed.type === "poker-create-room") {
       const roomId = String((typed as any).roomId ?? "").trim();
-      const tableName = String((typed as any).tableName ?? "")
-        .trim()
-        .slice(0, 48);
+      const tableName = String((typed as any).tableName ?? "").trim().slice(0, 48);
       const incomingPrivate =
         String((typed as any).private ?? "").trim() === "1" ||
         Boolean((typed as any).isPrivate);
@@ -793,7 +883,6 @@ wss.on("connection", (socket: WebSocket) => {
         ? "tournament"
         : "cash";
 
-      // force create
       getPokerRoomWithMode(roomId, inferredMode);
 
       const meta = pokerRooms.get(roomId);
@@ -824,6 +913,10 @@ wss.on("connection", (socket: WebSocket) => {
         return;
       }
 
+      // ✅ cancel pending grace cleanup now that they’re back
+      if (kind === "poker") cancelPokerDisconnectRemoval(String(roomId), String(playerId));
+      if (kind === "blackjack") cancelBjDisconnectRemoval(String(roomId), String(playerId));
+
       currentRoomId = roomId;
       currentPlayerId = playerId;
       currentKind = kind;
@@ -835,7 +928,10 @@ wss.on("connection", (socket: WebSocket) => {
         const meta = pokerRooms.get(roomId);
         const incomingName = String(
           (typed as any).tableName ?? (typed as any).name ?? ""
-        ).trim();
+        )
+          .trim()
+          .slice(0, 48);
+
         const incomingPrivate =
           String((typed as any).private ?? "").trim() === "1" ||
           Boolean((typed as any).isPrivate);
@@ -854,28 +950,51 @@ wss.on("connection", (socket: WebSocket) => {
           if (incomingPrivate) ensured.isPrivate = true;
         }
 
+        // ✅ reconnect path (don’t overwrite seats / identity)
+        try {
+          const known =
+            typeof (room as any).hasKnownPlayer === "function"
+              ? (room as any).hasKnownPlayer(playerId)
+              : false;
+
+          if (known && typeof (room as any).reconnectClient === "function") {
+            (room as any).reconnectClient(playerId, socket, (typed as any).name, {
+              tableName: (typed as any).tableName,
+              private: (typed as any).private ?? (typed as any).isPrivate,
+            });
+            return;
+          }
+        } catch {}
+
+        // ✅ Normal first-time join
         (room as any).addClient(playerId, socket, (typed as any).name, {
           tableName: (typed as any).tableName,
           private: (typed as any).private ?? (typed as any).isPrivate,
         });
-      } else if (kind === "blackjack") {
+
+        return;
+      }
+
+      // blackjack join
+      if (kind === "blackjack") {
         const incomingName = String(
           (typed as any).tableName ?? (typed as any).name ?? ""
-        ).trim();
+        )
+          .trim()
+          .slice(0, 48);
+
         const incomingPrivate =
           String((typed as any).private ?? "").trim() === "1" ||
           Boolean((typed as any).isPrivate);
 
         const room = getBlackjackRoom(roomId);
 
-        // Ensure meta exists & set host if missing (first joiner becomes host)
         const ensured = blackjackRooms.get(roomId);
         if (ensured) {
           if (!ensured.hostPlayerId) ensured.hostPlayerId = playerId;
           if (!ensured.tableName && incomingName) ensured.tableName = incomingName;
           if (incomingPrivate) ensured.isPrivate = true;
 
-          // Store tier hint for lobby display (real min/max comes from room snapshot)
           try {
             const snap = room.getSnapshot();
             ensured.minBet = snap.minBet;
@@ -883,7 +1002,9 @@ wss.on("connection", (socket: WebSocket) => {
           } catch {}
         }
 
+        // if your BJ supports reconnectClient, you can add it here similarly.
         room.addClient(playerId, socket, (typed as any).name);
+        return;
       }
 
       return;
@@ -895,7 +1016,6 @@ wss.on("connection", (socket: WebSocket) => {
       const roomId = String((typed as any).roomId ?? "").trim();
       const playerId = String((typed as any).playerId ?? "").trim();
 
-      // helpful log so you can confirm in Railway logs
       console.warn("[Coordinator] PRE-JOIN DROP CHECK", {
         type: (typed as any).type,
         kind,
@@ -904,6 +1024,10 @@ wss.on("connection", (socket: WebSocket) => {
       });
 
       if ((kind === "poker" || kind === "blackjack") && roomId && playerId) {
+        // cancel any pending disconnect cleanup if we’re auto-joining on reconnect
+        if (kind === "poker") cancelPokerDisconnectRemoval(roomId, playerId);
+        if (kind === "blackjack") cancelBjDisconnectRemoval(roomId, playerId);
+
         console.log("[Coordinator] Auto-joining from first message", {
           kind,
           roomId,
@@ -918,7 +1042,22 @@ wss.on("connection", (socket: WebSocket) => {
 
         if (kind === "poker") {
           const room = getPokerRoom(roomId);
-          (room as any).addClient(playerId, socket, (typed as any).name, {});
+
+          // if they’re known, reconnect; otherwise addClient
+          try {
+            const known =
+              typeof (room as any).hasKnownPlayer === "function"
+                ? (room as any).hasKnownPlayer(playerId)
+                : false;
+
+            if (known && typeof (room as any).reconnectClient === "function") {
+              (room as any).reconnectClient(playerId, socket, (typed as any).name, {});
+            } else {
+              (room as any).addClient(playerId, socket, (typed as any).name, {});
+            }
+          } catch {
+            (room as any).addClient(playerId, socket, (typed as any).name, {});
+          }
         } else {
           const room = getBlackjackRoom(roomId);
           room.addClient(playerId, socket, (typed as any).name);
@@ -953,7 +1092,6 @@ wss.on("connection", (socket: WebSocket) => {
   socket.on("close", () => {
     console.log("[Coordinator] Client disconnected");
 
-    // ✅ remove socket from tournament tracking
     untrackSocket(socket);
 
     if (heartbeatTimer) {
@@ -965,15 +1103,31 @@ wss.on("connection", (socket: WebSocket) => {
       touchRoom(currentKind, currentRoomId);
 
       if (currentKind === "poker") {
+        // ✅ start grace timer (so 10s app switch doesn't stand them up)
+        schedulePokerDisconnectRemoval(currentRoomId, currentPlayerId);
+
         const meta = pokerRooms.get(currentRoomId);
         try {
-          (meta?.room as any)?.removeClient?.(currentPlayerId);
-        } catch {}
+          // ✅ detach routing / mark disconnected (keeps seat)
+          (meta?.room as any)?.removeClient?.(currentPlayerId, "disconnect");
+        } catch {
+          // fallback if you still have markDisconnected in some builds
+          try {
+            (meta?.room as any)?.markDisconnected?.(currentPlayerId);
+          } catch {}
+        }
       } else {
+        // optional: BJ grace too
+        scheduleBjDisconnectRemoval(currentRoomId, currentPlayerId);
+
         const meta = blackjackRooms.get(currentRoomId);
         try {
-          meta?.room?.removeClient(currentPlayerId);
-        } catch {}
+          (meta?.room as any)?.removeClient?.(currentPlayerId, "disconnect");
+        } catch {
+          try {
+            meta?.room?.removeClient?.(currentPlayerId);
+          } catch {}
+        }
       }
     }
   });

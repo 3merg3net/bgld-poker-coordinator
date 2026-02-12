@@ -41,6 +41,167 @@ export class PokerRoomManager {
 
 private pauseTimer: NodeJS.Timeout | null = null;
 
+// inside PokerRoomManager class
+private disconnectTimers = new Map<string, NodeJS.Timeout>();
+private disconnectedAt = new Map<string, number>();
+
+// how long we tolerate mobile background drops
+private readonly DISCONNECT_GRACE_MS =
+  Number(process.env.POKER_DISCONNECT_GRACE_MS ?? "") || 45_000;
+
+private clearDisconnectTimer(playerId: string) {
+  const t = this.disconnectTimers.get(playerId);
+  if (t) clearTimeout(t);
+  this.disconnectTimers.delete(playerId);
+}
+
+public markDisconnected(playerId: string) {
+  if (!playerId) return;
+
+  // mark time + arm grace timer
+  this.disconnectedAt.set(playerId, Date.now());
+  this.clearDisconnectTimer(playerId);
+
+  // ✅ IMPORTANT: detach the dead socket so:
+  // - we stop trying to send to it
+  // - the grace timeout can detect "still disconnected"
+  this.clients.delete(playerId);
+
+  const t = setTimeout(() => {
+    // if still disconnected after grace -> finalize removal (cash out / clear seat)
+    if (this.clients.has(playerId)) return;              // reconnected
+    if (!this.disconnectedAt.has(playerId)) return;      // already handled
+    this.removeClient(playerId, "timeout");
+  }, this.DISCONNECT_GRACE_MS);
+
+  this.disconnectTimers.set(playerId, t as any);
+
+  // Optional: broadcast seats so others see them still seated
+  try {
+    void this.broadcastSeats();
+  } catch {}
+}
+
+public reconnectClient(
+  playerId: string,
+  socket: WebSocket,
+  name?: string,
+  meta?: { tableName?: string; private?: string | boolean | number }
+) {
+  if (!playerId || !socket) return;
+
+  // cancel pending timeout removal and mark as connected again
+  this.clearDisconnectTimer(playerId);
+  this.disconnectedAt.delete(playerId);
+
+  // ✅ restore expected client shape
+  this.clients.set(playerId, { socket, playerId, name });
+
+  // keep room meta capture consistent with addClient (optional)
+  try {
+    if (!this.tableName) {
+      const raw = typeof meta?.tableName === "string" ? meta.tableName.trim() : "";
+      if (raw) this.tableName = raw.slice(0, 24);
+    }
+    if (!this.isPrivate) {
+      const p = meta?.private;
+      const isP =
+        p === "1" || p === 1 || p === true || (typeof p === "string" && p.toLowerCase() === "true");
+      if (isP) this.isPrivate = true;
+    }
+  } catch {}
+
+  // ✅ resync the reconnecting client with current state (like addClient does)
+  try {
+    // seats + bankrolls (async, don’t block)
+    (async () => {
+      const bankrolls = await this.bankrollsSnapshot();
+      this.sendTo(playerId, {
+        kind: "poker",
+        roomId: this.roomId,
+        playerId,
+        type: "seats-update",
+        seats: this.seats,
+        bankrolls,
+      } as any);
+    })();
+
+    const lastTable = this.game.getLastState();
+    if (lastTable) {
+      this.sendTo(playerId, {
+        kind: "poker",
+        roomId: this.roomId,
+        playerId,
+        type: "table-state",
+        handId: lastTable.handId,
+        board: lastTable.board,
+        players: lastTable.players,
+      } as any);
+    }
+
+    const betting = this.game.getBettingState();
+    if (betting) {
+      this.sendTo(playerId, {
+        kind: "poker",
+        roomId: this.roomId,
+        playerId,
+        type: "betting-state",
+        handId: betting.handId,
+        street: betting.street,
+        pot: betting.pot,
+        buttonSeatIndex: betting.buttonSeatIndex,
+        currentSeatIndex: betting.currentSeatIndex,
+        bigBlind: betting.bigBlind,
+        smallBlind: betting.smallBlind,
+        maxCommitted: betting.maxCommitted,
+        players: betting.players,
+        smallBlindSeatIndex: (betting as any).smallBlindSeatIndex ?? null,
+        bigBlindSeatIndex: (betting as any).bigBlindSeatIndex ?? null,
+      } as any);
+    }
+
+    // if mid-hand, resend hero hole cards
+    const t = this.game.getLastState();
+    const b = this.game.getBettingState();
+    if (t && b && b.street !== "done") {
+      const cards = this.game.getHoleCardsForPlayer(playerId);
+      if (cards && cards.length >= 2) {
+        this.sendTo(playerId, {
+          kind: "poker",
+          roomId: this.roomId,
+          playerId: "server",
+          type: "hole-cards",
+          handId: t.handId,
+          cards: cards.slice(0, 2),
+        } as any);
+      }
+    }
+
+    // pause/hold state
+    this.sendTo(playerId, {
+      kind: "poker",
+      roomId: this.roomId,
+      playerId: "server",
+      type: "deal-hold-state",
+      held: this.dealHeld,
+      heldBy: this.dealHeldBy,
+      heldAt: this.dealHeldAt,
+    } as any);
+
+    // let everyone clear “reconnecting” UI if you add it later
+    void this.broadcastSeats();
+  } catch {}
+}
+
+public hasKnownPlayer(playerId: string) {
+  if (!playerId) return false;
+  if (this.clients.has(playerId)) return true;
+  if (this.disconnectedAt.has(playerId)) return true; // ✅ important
+  return this.seats.some((s) => s.playerId === playerId);
+}
+
+
+
 
 private broadcastPauseState() {
   // Use a lightweight message the client can optionally listen for.
@@ -372,17 +533,29 @@ public autoSeatTournamentPlayers(players: string[]) {
 
 
     private async bankrollsSnapshot(): Promise<Record<string, number>> {
-    const out: Record<string, number> = {};
-    for (const pid of this.clients.keys()) {
-      // never drop the key — default to 0 if anything goes wrong
-      try {
-        out[pid] = await this.getBankroll(pid);
-      } catch {
-        out[pid] = 0;
-      }
-    }
-    return out;
+  const out: Record<string, number> = {};
+
+  const ids = new Set<string>();
+
+  // include connected clients
+  for (const pid of this.clients.keys()) ids.add(pid);
+
+  // include seated players (even if disconnected)
+  for (const s of this.seats) {
+    if (s.playerId) ids.add(s.playerId);
   }
+
+  for (const pid of ids) {
+    try {
+      out[pid] = await this.getBankroll(pid);
+    } catch {
+      out[pid] = 0;
+    }
+  }
+
+  return out;
+}
+
 
 
   private async broadcastSeats() {
@@ -665,7 +838,7 @@ if (t && b && b.street !== "done") {
       } as any);
     }
 
-    // ✅ tell joining client current pause state
+    // ✅ tell joining client current deal-hold state (keys must match client)
 this.sendTo(playerId, {
   kind: "poker",
   roomId: this.roomId,
@@ -677,65 +850,82 @@ this.sendTo(playerId, {
 } as any);
 
 
+
   }
 
-  removeClient(playerId: string) {
-    if (!this.clients.has(playerId)) return;
-    this.clients.delete(playerId);
+ removeClient(
+  playerId: string,
+  reason: "disconnect" | "timeout" | "leave" = "disconnect"
+) {
+  // Always clear any pending timers
+  this.clearDisconnectTimer(playerId);
+  this.disconnectedAt.delete(playerId);
 
-    // If disconnect while seated, return stack to bankroll, then clear seat
-    let changed = false;
-    const stackToReturn = (() => {
-  const seat = this.seats.find((s) => s.playerId === playerId);
-  const stack = Math.max(0, Math.floor(Number(seat?.chips ?? 0)));
-  return stack;
-})();
-
-    this.seats = this.seats.map((s) => {
-      if (s.playerId === playerId) {
-        changed = true;
-        return { ...s, playerId: null, name: undefined, chips: 0 };
-      }
-      return s;
-    });
-        this.syncGameWithSeats("disconnect");
+  // ✅ DISCONNECT: keep seat/chips, just detach socket + arm grace removal
+  if (reason === "disconnect") {
+  // mark + schedule grace cleanup (markDisconnected will detach socket)
+  this.markDisconnected(playerId);
+  return;
+}
 
 
-       // Return stack asynchronously (cash mode only)
-    if (this.mode === "cash" && stackToReturn > 0) {
-      (async () => {
-        try {
-          await this.safeCredit(
-            playerId,
-            stackToReturn,
-            "poker_cashout",
-            this.roomId,
-            { reason: "disconnect" }
-          );
-          this.invalidateBankroll(playerId);
-          await this.broadcastSeats();
-        } catch {}
-      })();
+  // ✅ TIMEOUT / LEAVE: hard-remove even if client socket is already gone
+  // (timeout path will often NOT have a client entry anymore)
+  this.clients.delete(playerId);
+
+  // ---- your existing hard-remove logic continues below ----
+
+  // If disconnect while seated, return stack to bankroll, then clear seat
+  let changed = false;
+
+  const stackToReturn = (() => {
+    const seat = this.seats.find((s) => s.playerId === playerId);
+    const stack = Math.max(0, Math.floor(Number(seat?.chips ?? 0)));
+    return stack;
+  })();
+
+  this.seats = this.seats.map((s) => {
+    if (s.playerId === playerId) {
+      changed = true;
+      return { ...s, playerId: null, name: undefined, chips: 0 };
     }
+    return s;
+  });
 
+  this.syncGameWithSeats(reason);
 
-    if (changed) {
-      // broadcast immediately (seat cleared), bankroll update follows when credit completes
-      void this.broadcastSeats();
-    }
-
-    this.broadcast({
-      kind: "poker",
-      roomId: this.roomId,
-      playerId,
-      type: "room-left",
-    } as any);
-
-    if (this.clients.size === 0) {
-      this.resetTableState();
-    }
-   
+  // Return stack asynchronously (cash mode only)
+  if (this.mode === "cash" && stackToReturn > 0) {
+    (async () => {
+      try {
+        await this.safeCredit(playerId, stackToReturn, "poker_cashout", this.roomId, {
+          reason,
+        });
+        this.invalidateBankroll(playerId);
+        await this.broadcastSeats();
+      } catch {}
+    })();
   }
+
+  if (changed) {
+    // broadcast immediately (seat cleared), bankroll update follows when credit completes
+    void this.broadcastSeats();
+  }
+
+  this.broadcast({
+    kind: "poker",
+    roomId: this.roomId,
+    playerId,
+    type: "room-left",
+    reason,
+  } as any);
+
+  if (this.clients.size === 0) {
+    this.resetTableState();
+  }
+}
+
+
 
   
 
@@ -1609,49 +1799,67 @@ if (!betting) return;
   // ─────────────────────────────────────────────────────────────
 
   private cleanupGhostSeats() {
-    const activeIds = new Set(this.clients.keys());
-    let changed = false;
+  const now = Date.now();
 
-    this.seats = this.seats.map((s) => {
-      if (s.playerId && !activeIds.has(s.playerId)) {
-        changed = true;
-        return { ...s, playerId: null, handle: undefined, name: undefined, chips: 0 };
-      }
+  // connected sockets
+  const activeIds = new Set(this.clients.keys());
+
+  let changed = false;
+
+  this.seats = this.seats.map((s) => {
+    if (!s.playerId) return s;
+
+    const pid = s.playerId;
+
+    // ✅ If connected, keep
+    if (activeIds.has(pid)) return s;
+
+    // ✅ If disconnected but within grace, keep seat/chips
+    const discAt = this.disconnectedAt.get(pid);
+    if (discAt && now - discAt < this.DISCONNECT_GRACE_MS) {
       return s;
-    });
-
-        if (changed) {
-      this.syncGameWithSeats("cleanupGhostSeats");
-      void this.broadcastSeats();
     }
 
+    // ✅ Otherwise, it's truly a ghost -> clear it
+    changed = true;
+    return { ...s, playerId: null, handle: undefined, name: undefined, chips: 0 };
+  });
+
+  if (changed) {
+    this.syncGameWithSeats("cleanupGhostSeats");
+    void this.broadcastSeats();
   }
+}
+
 
   private resetTableState() {
-    this.clearAutoDealTimer();
-    this.revealedThisHand.clear();
+  this.clearAutoDealTimer();
+  this.revealedThisHand.clear();
 
-    const freshSeats: SeatView[] = [];
-    for (let i = 0; i < 9; i++) {
-      this.seats.push({
-  seatIndex: i,
-  playerId: null,
-  handle: undefined, // ✅ ADD
-  name: undefined,
-  chips: 0,
-});
-
-    }
-
-    this.seats = freshSeats;
-    this.game = new HoldemGame();
-    this.handInProgress = false;
-    this.totalFakeRake = 0;
-
-    console.log(
-      `[PokerRoom:${this.roomId}] All clients gone. Resetting table state.`
-    );
+  const freshSeats: SeatView[] = [];
+  for (let i = 0; i < 9; i++) {
+    freshSeats.push({
+      seatIndex: i,
+      playerId: null,
+      handle: undefined,
+      name: undefined,
+      chips: 0,
+    });
   }
+
+  this.seats = freshSeats;
+  this.game = new HoldemGame();
+  this.handInProgress = false;
+  this.totalFakeRake = 0;
+
+  // also clear disconnect tracking
+  for (const t of this.disconnectTimers.values()) clearTimeout(t);
+  this.disconnectTimers.clear();
+  this.disconnectedAt.clear();
+
+  console.log(`[PokerRoom:${this.roomId}] All clients gone. Resetting table state.`);
+}
+
 
   public shutdown(reason = "Room shutdown") {
   // stop timers
