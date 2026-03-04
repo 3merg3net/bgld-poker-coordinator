@@ -10,16 +10,22 @@ export type ChipBalances = {
 };
 
 /**
- * IMPORTANT:
- * Your error "duplicate key value violates unique constraint chip_balances_pkey"
- * comes from doing a plain INSERT when the row already exists.
- *
- * Fix: UPSERT on player_id (or whatever your PK is).
+ * Ensures:
+ * 1) players row exists (required by FK chip_balances_player_id_fkey)
+ * 2) chip_balances row exists (UPSERT-safe)
  */
 export async function ensureChipBalanceRow(playerId: string): Promise<ChipBalances> {
   if (!playerId || playerId.length < 3) throw new Error("Missing playerId");
 
-  // 1) Try read
+  // 0) ✅ Ensure the player exists (FK requirement)
+  // Only upsert the PK to avoid clobbering any real profile fields.
+  const { error: playerUpErr } = await supabaseAdmin
+    .from("players")
+    .upsert({ id: playerId }, { onConflict: "id" });
+
+  if (playerUpErr) throw new Error(playerUpErr.message);
+
+  // 1) Try read balances
   const { data, error } = await supabaseAdmin
     .from("chip_balances")
     .select("player_id, balance_gld, reserved_gld, balance_pgld, reserved_pgld")
@@ -38,7 +44,7 @@ export async function ensureChipBalanceRow(playerId: string): Promise<ChipBalanc
     };
   }
 
-  // 2) Create row safely (UPSERT instead of INSERT)
+  // 2) Create balance row safely (UPSERT)
   const row = {
     player_id: playerId,
     balance_gld: 0,
@@ -47,15 +53,13 @@ export async function ensureChipBalanceRow(playerId: string): Promise<ChipBalanc
     reserved_pgld: 0,
   };
 
-  // If your PK is player_id, this works as-is.
-  // If you have a composite key, adjust onConflict accordingly.
   const { error: upErr } = await supabaseAdmin
     .from("chip_balances")
     .upsert(row, { onConflict: "player_id" });
 
   if (upErr) throw new Error(upErr.message);
 
-  // 3) Re-read (ensures we return the canonical row)
+  // 3) Re-read (return canonical row)
   const { data: data2, error: err2 } = await supabaseAdmin
     .from("chip_balances")
     .select("player_id, balance_gld, reserved_gld, balance_pgld, reserved_pgld")

@@ -5,6 +5,8 @@
 // 2) Add support for tournament UI (private hole cards) WITHOUT changing existing broadcast types
 // 3) Provide a safe per-player hole-cards getter that the manager can use to send private "hole-cards" msgs
 // 4) Keep all existing betting logic intact
+// ✅ NEW: If winner wins by folds, do NOT auto-show hole cards.
+//         Winner may optionally reveal via "show-cards" button (manager-controlled).
 
 // Basic seat shape that the room + frontend use
 export type SeatView = {
@@ -14,7 +16,6 @@ export type SeatView = {
   name?: string;
   chips?: number;
 };
-
 
 // Table state broadcast (legacy cash UI uses this)
 export type TablePlayerState = {
@@ -154,6 +155,10 @@ export class HoldemGame {
   // Keeps hero cards available even if you later stop broadcasting holeCards in TableState.
   private holeCardsByPlayer: Map<string, Card[]> = new Map();
 
+  // ✅ NEW: fold-win bookkeeping (to avoid auto-reveal)
+  private foldWinHandId: number | null = null;
+  private foldWinWinnerId: string | null = null;
+
   private touch(reason: string) {
     this.lastProgressAt = Date.now();
     // console.log(`[HoldemGame] ${reason}`);
@@ -172,6 +177,10 @@ export class HoldemGame {
 
     // ✅ clear private hole cards
     this.holeCardsByPlayer.clear();
+
+    // ✅ clear fold-win markers
+    this.foldWinHandId = null;
+    this.foldWinWinnerId = null;
 
     // keep seatsSnapshot (manager is source of truth)
     this.touch(`abort:${reason}`);
@@ -244,6 +253,22 @@ export class HoldemGame {
   }
 
   /**
+   * ✅ Helper for "show-cards" button:
+   * Manager can call this and broadcast a custom message.
+   */
+  revealPlayerHoleCards(playerId: string): {
+    handId: number;
+    playerId: string;
+    holeCards: string[];
+  } | null {
+    const b = this.betting;
+    if (!b) return null;
+    const hole = this.getPrivateHoleCards(playerId);
+    if (!hole) return null;
+    return { handId: b.handId, playerId, holeCards: hole };
+  }
+
+  /**
    * If an all-in situation occurred with no actions left, this returns
    * the reveal payload ONCE, then clears it.
    */
@@ -278,6 +303,10 @@ export class HoldemGame {
 
     // Snapshot seats for this hand
     this.seatsSnapshot = seats.map((s) => ({ ...s }));
+
+    // ✅ reset fold-win markers per hand
+    this.foldWinHandId = null;
+    this.foldWinWinnerId = null;
 
     // Set / rotate button seat
     if (this.buttonSeatIndex == null) {
@@ -462,17 +491,16 @@ export class HoldemGame {
     }
 
     if (action === "fold") {
-  // ✅ IMPORTANT:
-  // Keep inHand=true so showdown/payout logic can still see contributors.
-  // Fold is represented by hasFolded=true.
-  p.hasFolded = true;
-  p.hasActed = true;
+      // ✅ IMPORTANT:
+      // Keep inHand=true so showdown/payout logic can still see contributors.
+      // Fold is represented by hasFolded=true.
+      p.hasFolded = true;
+      p.hasActed = true;
 
-  // Optional: fold clears committed for “owes” checks this street.
-  // (totalContributed stays; those chips are already in the pot)
-  // p.committed = p.committed;
-}
- else if (action === "check") {
+      // Optional: fold clears committed for “owes” checks this street.
+      // (totalContributed stays; those chips are already in the pot)
+      // p.committed = p.committed;
+    } else if (action === "check") {
       // ✅ CHECK must be free; only allowed if you owe nothing.
       // If UI accidentally sends "check" when it should be "call", we ignore it.
       if (callNeeded === 0) {
@@ -532,14 +560,10 @@ export class HoldemGame {
     if (this.showdown) return this.showdown;
 
     const board = t.board;
-    // ✅ Robust: "active contenders" are simply players who have NOT folded.
-// inHand should remain true, but don't let a bad flag break payouts.
-const active = b.players.filter((p) => !p.hasFolded && (p.totalContributed > 0 || p.stack >= 0));
-if (active.length === 0) {
-  // If literally everyone is folded (shouldn't happen), pick the last non-folded by seat.
-  return null;
-}
 
+    // ✅ Robust: contenders are simply players who have NOT folded.
+    const active = b.players.filter((p) => !p.hasFolded);
+    if (active.length === 0) return null;
 
     type EvalResult = {
       score: number;
@@ -558,6 +582,7 @@ if (active.length === 0) {
       const hole = tp.holeCards;
       const seven = [...hole, ...board];
 
+      // If board not complete (i.e., fold-win), we still create an eval record.
       if (seven.length < 7) {
         evals.push({
           bp,
@@ -577,16 +602,22 @@ if (active.length === 0) {
     if (evals.length === 0) return null;
 
     // -----------------------------
-    // SIDE POT & PAYOUT CALCULATION
+    // SIDE POT & PAYOUT CALCULATION (WITH 5% RAKE)
     // -----------------------------
 
+    // Ensure pot matches total contributed (source of truth)
     const totalPotFromContrib = b.players.reduce(
       (sum, p) => sum + (p.totalContributed || 0),
       0
     );
-    if (totalPotFromContrib > 0) {
-      b.pot = totalPotFromContrib;
-    }
+    if (totalPotFromContrib > 0) b.pot = totalPotFromContrib;
+
+    const totalPot = Math.max(0, Math.floor(Number(b.pot ?? 0)));
+    const targetRake = Math.max(0, Math.floor(totalPot * 0.05));
+
+    // optional: expose on betting for manager/UI (non-breaking)
+    (b as any).rake = targetRake;
+    (b as any).potAfterRake = Math.max(0, totalPot - targetRake);
 
     const payouts: Record<string, number> = {};
     for (const pl of b.players) payouts[pl.playerId] = 0;
@@ -601,11 +632,20 @@ if (active.length === 0) {
 
     if (levels.length === 0) levels.push(0);
 
-    let prevLevel = 0;
+    // Build chunks so we can rake each chunk deterministically
+    type Chunk = {
+      potChunk: number;
+      winners: { bp: BettingPlayerState; eval: any }[];
+      minLevel: number;
+      prevLevel: number;
+    };
 
+    const chunks: Chunk[] = [];
+
+    let prevLevel = 0;
     for (const level of levels) {
       const contributingPlayers = b.players.filter(
-        (p) => p.totalContributed >= level
+        (p) => (p.totalContributed || 0) >= level
       );
       if (contributingPlayers.length === 0) {
         prevLevel = level;
@@ -621,7 +661,7 @@ if (active.length === 0) {
       const potChunk = layerAmount * contributingPlayers.length;
 
       const eligibleEvals = evals.filter(
-        ({ bp }) => bp.totalContributed >= level
+        ({ bp }) => (bp.totalContributed || 0) >= level
       );
       if (eligibleEvals.length === 0) {
         prevLevel = level;
@@ -632,25 +672,52 @@ if (active.length === 0) {
       for (const e of eligibleEvals) {
         if (e.eval.score > bestScore) bestScore = e.eval.score;
       }
-
       const winners = eligibleEvals.filter((e) => e.eval.score === bestScore);
 
-      const share = Math.floor(potChunk / winners.length);
-      let remainder = potChunk - share * winners.length;
+      chunks.push({ potChunk, winners, minLevel: level, prevLevel });
+      prevLevel = level;
+    }
 
-      for (const { bp } of winners) {
+    // Compute per-chunk rake = floor(5% chunk), then distribute leftover +1 until total == targetRake
+    const baseChunkRakes = chunks.map((c) => Math.floor(c.potChunk * 0.05));
+    const sumBase = baseChunkRakes.reduce((a, x) => a + x, 0);
+
+    let missing = Math.max(0, targetRake - sumBase);
+    const finalChunkRakes = baseChunkRakes.slice();
+
+    for (let i = 0; i < finalChunkRakes.length && missing > 0; i++) {
+      // only add if chunk has at least 1 chip to spare
+      if (chunks[i].potChunk - finalChunkRakes[i] > 0) {
+        finalChunkRakes[i] += 1;
+        missing -= 1;
+      }
+    }
+
+    // Pay winners using (chunk - rake)
+    for (let i = 0; i < chunks.length; i++) {
+      const c = chunks[i];
+      const rakeThisChunk = Math.min(c.potChunk, finalChunkRakes[i] || 0);
+      const distributable = c.potChunk - rakeThisChunk;
+
+      if (distributable <= 0) continue;
+      if (!c.winners || c.winners.length === 0) continue;
+
+      const share = Math.floor(distributable / c.winners.length);
+      let remainder = distributable - share * c.winners.length;
+
+      for (const { bp } of c.winners) {
         payouts[bp.playerId] += share;
       }
 
       if (remainder > 0) {
-        const sortedWinners = winners
+        // remainder to lowest seatIndex winner
+        const sortedWinners = c.winners
           .slice()
           .sort((a, b2) => a.bp.seatIndex - b2.bp.seatIndex);
+
         payouts[sortedWinners[0].bp.playerId] += remainder;
         remainder = 0;
       }
-
-      prevLevel = level;
     }
 
     // Apply payouts to stacks and mirror back to seatsSnapshot
@@ -667,6 +734,10 @@ if (active.length === 0) {
       if (bp) seat.chips = bp.stack;
     }
 
+    // ✅ fold-win detection: if we ended via folds, do not auto-reveal any hole cards
+    const isFoldWin =
+      this.foldWinHandId === t.handId && !!this.foldWinWinnerId;
+
     // Build showdownPlayers with winner flags
     const showdownPlayers: ShowdownPlayerState[] = [];
     for (const { bp, eval: ev } of evals) {
@@ -678,9 +749,9 @@ if (active.length === 0) {
       showdownPlayers.push({
         seatIndex: bp.seatIndex,
         playerId: bp.playerId,
-        holeCards: tp.holeCards.slice(),
+        holeCards: isFoldWin ? [] : tp.holeCards.slice(),
         bestHand: ev.best5,
-        rankName: ev.rankName,
+        rankName: isFoldWin ? "Wins by fold" : ev.rankName,
         isWinner: (payouts[bp.playerId] || 0) > 0,
       });
     }
@@ -758,6 +829,12 @@ if (active.length === 0) {
     if (activePlayers.length <= 1) {
       b.street = "done";
       b.currentSeatIndex = null;
+
+      // ✅ mark fold-win so showdown does not reveal hole cards
+      const winner = activePlayers[0];
+      this.foldWinHandId = b.handId;
+      this.foldWinWinnerId = winner?.playerId ?? null;
+
       this.betting = b;
       return;
     }
@@ -771,7 +848,8 @@ if (active.length === 0) {
         const revealPlayers: AllInRevealPlayer[] = activePlayers
           .map((bp) => {
             const tp = t.players.find(
-              (pl) => pl.playerId === bp.playerId && pl.seatIndex === bp.seatIndex
+              (pl) =>
+                pl.playerId === bp.playerId && pl.seatIndex === bp.seatIndex
             );
             return tp
               ? {
@@ -828,7 +906,11 @@ if (active.length === 0) {
       }
 
       // Next to act postflop starts left of button
-      const nextSeat = this.findNextSeatToAct(b.players, b.buttonSeatIndex, true);
+      const nextSeat = this.findNextSeatToAct(
+        b.players,
+        b.buttonSeatIndex,
+        true
+      );
 
       // If nobody can act on the new street, end.
       if (nextSeat == null) {
@@ -902,7 +984,10 @@ if (active.length === 0) {
   } {
     // Defensive guard
     if (cards.length !== 7) {
-      console.error(`evaluateSevenCards expects 7 cards, got ${cards.length}`, cards);
+      console.error(
+        `evaluateSevenCards expects 7 cards, got ${cards.length}`,
+        cards
+      );
       return { score: 0, rankName: "No hand", best5: cards.slice(0, 5) };
     }
 
@@ -917,7 +1002,8 @@ if (active.length === 0) {
           for (let d = c + 1; d < n - 1; d++) {
             for (let e = d + 1; e < n; e++) {
               const combo = [cards[a], cards[b], cards[c], cards[d], cards[e]];
-              const { category, ranksDesc, rankName } = this.evaluateFiveCards(combo);
+              const { category, ranksDesc, rankName } =
+                this.evaluateFiveCards(combo);
               const score = this.buildRankScore(category, ranksDesc);
 
               if (score > bestScore) {
@@ -960,18 +1046,39 @@ if (active.length === 0) {
     }
 
     const groups = Object.keys(rankCounts)
-      .map((key) => ({ rank: Number(key), count: rankCounts[Number(key)] }))
-      .sort((a, b) => (b.count !== a.count ? b.count - a.count : b.rank - a.rank));
+      .map((key) => ({
+        rank: Number(key),
+        count: rankCounts[Number(key)],
+      }))
+      .sort((a, b) =>
+        b.count !== a.count ? b.count - a.count : b.rank - a.rank
+      );
 
     const counts = groups.map((g) => g.count);
     const topRank = groups[0]?.rank ?? 0;
     const secondRank = groups[1]?.rank ?? 0;
 
     const labelRankPlural = (r: number) =>
-      r === 14 ? "Aces" : r === 13 ? "Kings" : r === 12 ? "Queens" : r === 11 ? "Jacks" : `${r}s`;
+      r === 14
+        ? "Aces"
+        : r === 13
+        ? "Kings"
+        : r === 12
+        ? "Queens"
+        : r === 11
+        ? "Jacks"
+        : `${r}s`;
 
     const labelRankHigh = (r: number) =>
-      r === 14 ? "Ace-high" : r === 13 ? "King-high" : r === 12 ? "Queen-high" : r === 11 ? "Jack-high" : `${r}-high`;
+      r === 14
+        ? "Ace-high"
+        : r === 13
+        ? "King-high"
+        : r === 12
+        ? "Queen-high"
+        : r === 11
+        ? "Jack-high"
+        : `${r}-high`;
 
     // Straight detection (wheel A-5)
     let isStraight = false;
@@ -1020,16 +1127,29 @@ if (active.length === 0) {
     if (isFlush && isStraight) {
       const sfHigh = straightHigh;
       if (sfHigh === 14) {
-        return { category: 8, ranksDesc: [14, 13, 12, 11, 10], rankName: "Royal flush" };
+        return {
+          category: 8,
+          ranksDesc: [14, 13, 12, 11, 10],
+          rankName: "Royal flush",
+        };
       }
-      return { category: 8, ranksDesc: [sfHigh], rankName: `Straight flush (${labelRankHigh(sfHigh)})` };
+      return {
+        category: 8,
+        ranksDesc: [sfHigh],
+        rankName: `Straight flush (${labelRankHigh(sfHigh)})`,
+      };
     }
 
     // Four of a kind
     if (counts[0] === 4) {
       const quadRank = topRank;
-      const kickerRank = uniqueRanksDesc.find((r) => r !== quadRank) ?? quadRank;
-      return { category: 7, ranksDesc: [quadRank, kickerRank], rankName: `Four of ${labelRankPlural(quadRank)}` };
+      const kickerRank =
+        uniqueRanksDesc.find((r) => r !== quadRank) ?? quadRank;
+      return {
+        category: 7,
+        ranksDesc: [quadRank, kickerRank],
+        rankName: `Four of ${labelRankPlural(quadRank)}`,
+      };
     }
 
     // Full house
@@ -1039,7 +1159,9 @@ if (active.length === 0) {
       return {
         category: 6,
         ranksDesc: [tripRank, pairRank],
-        rankName: `Full house, ${labelRankPlural(tripRank)} over ${labelRankPlural(pairRank)}`,
+        rankName: `Full house, ${labelRankPlural(tripRank)} over ${labelRankPlural(
+          pairRank
+        )}`,
       };
     }
 
@@ -1048,19 +1170,31 @@ if (active.length === 0) {
       const sortedFlush = ranks.slice().sort((a, b) => b - a);
       const top5 = sortedFlush.slice(0, 5);
       const high = top5[0];
-      return { category: 5, ranksDesc: top5, rankName: `Flush (${labelRankHigh(high)})` };
+      return {
+        category: 5,
+        ranksDesc: top5,
+        rankName: `Flush (${labelRankHigh(high)})`,
+      };
     }
 
     // Straight
     if (isStraight) {
-      return { category: 4, ranksDesc: [straightHigh], rankName: `Straight (${labelRankHigh(straightHigh)})` };
+      return {
+        category: 4,
+        ranksDesc: [straightHigh],
+        rankName: `Straight (${labelRankHigh(straightHigh)})`,
+      };
     }
 
     // Trips
     if (counts[0] === 3) {
       const tripRank = topRank;
       const kickers = uniqueRanksDesc.filter((r) => r !== tripRank).slice(0, 2);
-      return { category: 3, ranksDesc: [tripRank, ...kickers], rankName: `Three of a kind (${labelRankPlural(tripRank)})` };
+      return {
+        category: 3,
+        ranksDesc: [tripRank, ...kickers],
+        rankName: `Three of a kind (${labelRankPlural(tripRank)})`,
+      };
     }
 
     // Two pair
@@ -1069,11 +1203,14 @@ if (active.length === 0) {
       const pair2 = secondRank;
       const hiPair = Math.max(pair1, pair2);
       const loPair = Math.min(pair1, pair2);
-      const kicker = uniqueRanksDesc.find((r) => r !== hiPair && r !== loPair) ?? hiPair;
+      const kicker =
+        uniqueRanksDesc.find((r) => r !== hiPair && r !== loPair) ?? hiPair;
       return {
         category: 2,
         ranksDesc: [hiPair, loPair, kicker],
-        rankName: `Two pair (${labelRankPlural(hiPair)} and ${labelRankPlural(loPair)})`,
+        rankName: `Two pair (${labelRankPlural(hiPair)} and ${labelRankPlural(
+          loPair
+        )})`,
       };
     }
 
@@ -1081,13 +1218,30 @@ if (active.length === 0) {
     if (counts[0] === 2) {
       const pairRank = topRank;
       const kickers = uniqueRanksDesc.filter((r) => r !== pairRank).slice(0, 3);
-      return { category: 1, ranksDesc: [pairRank, ...kickers], rankName: `Pair of ${labelRankPlural(pairRank)}` };
+      return {
+        category: 1,
+        ranksDesc: [pairRank, ...kickers],
+        rankName: `Pair of ${labelRankPlural(pairRank)}`,
+      };
     }
 
     // High card
     const top5 = uniqueRanksDesc.slice(0, 5);
     const high = top5[0];
-    const highLabel = high === 14 ? "Ace" : high === 13 ? "King" : high === 12 ? "Queen" : high === 11 ? "Jack" : `${high}`;
-    return { category: 0, ranksDesc: top5, rankName: `High card ${highLabel}` };
+    const highLabel =
+      high === 14
+        ? "Ace"
+        : high === 13
+        ? "King"
+        : high === 12
+        ? "Queen"
+        : high === 11
+        ? "Jack"
+        : `${high}`;
+    return {
+      category: 0,
+      ranksDesc: top5,
+      rankName: `High card ${highLabel}`,
+    };
   }
 }
