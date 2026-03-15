@@ -12,7 +12,7 @@ import type {
 import type { Card } from "../game/cards";
 import { makeDeck, shuffle } from "../game/cards";
 
-const MAX_SEATS = 7;
+const MAX_SEATS = 5;
 const START_BANKROLL = 10_000;
 
 // Defaults if roomId does not encode a tier
@@ -105,7 +105,7 @@ export class BlackjackRoomManager {
   private betTimer: NodeJS.Timeout | null = null;
   private roundCompleteTimeout: NodeJS.Timeout | null = null;
 
-  // ✅ server-side action timer (prevents client-timeout bugs)
+  // server-side action timer
   private actionDeadline: number | null = null;
   private actionTimer: NodeJS.Timeout | null = null;
   private actionKey: string | null = null;
@@ -117,7 +117,6 @@ export class BlackjackRoomManager {
 
   private static readonly DEALER_REVEAL_DELAY_MS = 700;
   private static readonly DEALER_HIT_DELAY_MS = 850;
-
   private static readonly BET_WINDOW_MS = 10_000;
 
   constructor(roomId: string) {
@@ -138,11 +137,10 @@ export class BlackjackRoomManager {
 
     this.resetShoe();
     console.log(
-      `[BlackjackRoomManager] Created room ${roomId} (min=${this.minBet}, max=${this.maxBet})`
+      `[BlackjackRoomManager] Created room ${roomId} (min=${this.minBet}, max=${this.maxBet}, seats=${MAX_SEATS})`
     );
   }
 
-  // ✅ lobby snapshot
   getSnapshot() {
     return {
       roomId: this.roomId,
@@ -160,7 +158,6 @@ export class BlackjackRoomManager {
     };
   }
 
-  // ✅ admin delete / prune support
   shutdown(reason = "Room closed") {
     const payload = JSON.stringify({
       kind: "blackjack",
@@ -187,8 +184,6 @@ export class BlackjackRoomManager {
     this.betDeadline = null;
   }
 
-  // ---- shoe / dealing ----
-
   private resetShoe() {
     let full: Card[] = [];
     for (let i = 0; i < 6; i++) full = full.concat(makeDeck());
@@ -204,8 +199,6 @@ export class BlackjackRoomManager {
     }
     return card;
   }
-
-  // ---- timers (safe clears) ----
 
   private clearBetTimer() {
     if (this.betTimer) {
@@ -237,10 +230,6 @@ export class BlackjackRoomManager {
     this.actionKey = null;
   }
 
-  /**
-   * ✅ Arm a turn timer ONLY for the active hand.
-   * On timeout, we auto-stand ONLY that hand, then advance.
-   */
   private armActionTimer() {
     if (this.phase !== "player-action") {
       this.clearActionTimer();
@@ -258,7 +247,6 @@ export class BlackjackRoomManager {
     this.actionDeadline = Date.now() + BlackjackRoomManager.ACTION_WINDOW_MS;
 
     this.actionTimer = setTimeout(() => {
-      // stale timer guard
       if (this.phase !== "player-action") return;
       if (this.actionKey !== key) return;
       if (this.activeSeatIndex === null || this.activeHandIndex === null) return;
@@ -266,14 +254,12 @@ export class BlackjackRoomManager {
       const seat = this.seats[this.activeSeatIndex];
       const hand = seat?.hands?.[this.activeHandIndex];
 
-      // if seat/hand is missing or already resolved, just advance
       if (!seat || !hand) {
         this.setNextActiveHand();
         this.broadcastState();
         return;
       }
 
-      // ✅ Auto-stand ONLY this hand (never everyone)
       if (
         hand.bet > 0 &&
         normalizeResult(hand.result) === "pending" &&
@@ -288,7 +274,6 @@ export class BlackjackRoomManager {
     }, BlackjackRoomManager.ACTION_WINDOW_MS);
   }
 
-  // ✅ Safety: after weird events (disconnect/leave), ensure active pointers are valid
   private advanceGameIfNeeded() {
     if (this.phase !== "player-action") return;
 
@@ -313,10 +298,7 @@ export class BlackjackRoomManager {
     }
   }
 
-  // ---- public API called from server.ts ----
-
   addClient(playerId: string, socket: WebSocket, name?: string) {
-    // If same player reconnects, replace socket
     this.clients.set(playerId, { socket, name });
     console.log(
       `[BlackjackRoomManager] Player ${playerId} connected to room ${this.roomId}`
@@ -331,7 +313,6 @@ export class BlackjackRoomManager {
     const seat = seatIndex >= 0 ? this.seats[seatIndex] : null;
 
     if (seat) {
-      // ✅ Mid-round disconnect: DO NOT clear hands; auto-stand pending hands and keep flow.
       if (this.phase !== "waiting-bets") {
         seat.playerId = null;
 
@@ -346,13 +327,11 @@ export class BlackjackRoomManager {
           }
         }
 
-        // If it was their turn, advance immediately
         if (this.phase === "player-action" && this.activeSeatIndex === seatIndex) {
           this.clearActionTimer();
           this.setNextActiveHand();
         }
       } else {
-        // waiting-bets: safe to clear
         seat.playerId = null;
         seat.hands = [];
       }
@@ -382,8 +361,6 @@ export class BlackjackRoomManager {
     }
   }
 
-  // ---- seat management ----
-
   private handleSeatMessage(msg: ClientToServerMessage) {
     const { playerId } = msg;
     const action = msg.action as "sit" | "leave" | undefined;
@@ -400,7 +377,6 @@ export class BlackjackRoomManager {
         return;
       }
 
-      // Don’t allow taking a different seat while already seated elsewhere
       const otherSeat = this.seats.find((s) => s.playerId === playerId);
       if (otherSeat && otherSeat.seatIndex !== seatIndex) {
         this.sendError(playerId, "You are already seated");
@@ -414,7 +390,6 @@ export class BlackjackRoomManager {
       }
     } else if (action === "leave") {
       if (seat.playerId === playerId) {
-        // ✅ leaving mid-round: auto-stand pending hands so game flow never freezes
         for (const h of seat.hands) {
           if (
             h.bet > 0 &&
@@ -428,7 +403,6 @@ export class BlackjackRoomManager {
 
         seat.playerId = null;
 
-        // If it was their active turn, advance safely
         if (this.phase === "player-action") {
           this.advanceGameIfNeeded();
         }
@@ -437,8 +411,6 @@ export class BlackjackRoomManager {
 
     this.broadcastState();
   }
-
-  // ---- betting + round lifecycle ----
 
   private openBetWindow() {
     this.clearBetTimer();
@@ -468,7 +440,6 @@ export class BlackjackRoomManager {
 
   private handlePlaceBet(msg: ClientToServerMessage) {
     if (this.phase === "round-complete") {
-      // allow “bet next hand” to immediately reopen betting
       this.clearRoundCompleteTimeout();
       this.phase = "waiting-bets";
       this.dealerCards = [];
@@ -505,7 +476,6 @@ export class BlackjackRoomManager {
       return;
     }
 
-    // Only allow a pre-deal bet “stub” in waiting-bets
     const existingHand = seat.hands.find((h) => h.bet > 0 && h.cards.length === 0);
     if (existingHand) {
       seat.bankroll -= amount;
@@ -533,6 +503,32 @@ export class BlackjackRoomManager {
     this.broadcastState();
   }
 
+  /**
+   * 5-seat physical table order.
+   *
+   * UI layout:
+   * 0 = far left
+   * 1 = left-mid
+   * 2 = center
+   * 3 = right-mid
+   * 4 = far right
+   *
+   * Blackjack deal/action should move dealer's right -> left:
+   * 4 → 3 → 2 → 1 → 0
+   */
+  private getTableOrder(): number[] {
+    return [4, 3, 2, 1, 0];
+  }
+
+  private getDealingSeatIndexes(): number[] {
+    const tableOrder = this.getTableOrder();
+
+    return tableOrder.filter((seatIndex) => {
+      const seat = this.seats[seatIndex];
+      return !!seat?.playerId && seat.hands.some((h) => Number(h.bet ?? 0) > 0);
+    });
+  }
+
   private startRound() {
     this.roundId += 1;
 
@@ -542,34 +538,73 @@ export class BlackjackRoomManager {
     this.clearActionTimer();
     this.dealerHoleRevealed = false;
 
-    this.dealerCards = [];
-    this.dealerCards.push(this.drawCard()); // up
-    this.dealerCards.push(this.drawCard()); // hole
+    const dealingSeatIndexes = this.getDealingSeatIndexes();
 
     for (const seat of this.seats) {
-      for (const hand of seat.hands) {
-        if (hand.bet > 0) {
-          hand.cards = [this.drawCard(), this.drawCard()];
-          hand.isBusted = false;
-          hand.isBlackjack = isBlackjack(hand.cards);
-          hand.payout = 0;
+      const existingBetHand = seat.hands.find((h) => Number(h.bet ?? 0) > 0);
 
-          if (hand.isBlackjack) {
-            hand.result = "blackjack";
-            hand.isStanding = true;
-          } else {
-            hand.result = "pending";
-            hand.isStanding = false;
-          }
-        }
+      if (!seat.playerId || !existingBetHand) {
+        seat.hands = [];
+        continue;
+      }
+
+      seat.hands = [
+        {
+          handIndex: 0,
+          cards: [],
+          bet: Number(existingBetHand.bet ?? 0),
+          isBusted: false,
+          isStanding: false,
+          isBlackjack: false,
+          result: "pending",
+          payout: 0,
+        },
+      ];
+    }
+
+    // 1) one card to each player in table order
+    for (const seatIndex of dealingSeatIndexes) {
+      const seat = this.seats[seatIndex];
+      const hand = seat.hands[0];
+      if (!hand) continue;
+      hand.cards.push(this.drawCard());
+    }
+
+    // 2) dealer upcard
+    this.dealerCards = [this.drawCard()];
+
+    // 3) second card to each player in same order
+    for (const seatIndex of dealingSeatIndexes) {
+      const seat = this.seats[seatIndex];
+      const hand = seat.hands[0];
+      if (!hand) continue;
+      hand.cards.push(this.drawCard());
+    }
+
+    // 4) dealer hole card
+    this.dealerCards.push(this.drawCard());
+
+    for (const seatIndex of dealingSeatIndexes) {
+      const seat = this.seats[seatIndex];
+      const hand = seat.hands[0];
+      if (!hand) continue;
+
+      hand.isBusted = false;
+      hand.isBlackjack = isBlackjack(hand.cards);
+      hand.payout = 0;
+
+      if (hand.isBlackjack) {
+        hand.result = "blackjack";
+        hand.isStanding = true;
+      } else {
+        hand.result = "pending";
+        hand.isStanding = false;
       }
     }
 
     this.betDeadline = null;
-
     this.phase = "player-action";
 
-    // start from the first eligible hand
     this.activeSeatIndex = null;
     this.activeHandIndex = null;
     this.setNextActiveHand();
@@ -577,42 +612,36 @@ export class BlackjackRoomManager {
     this.broadcastState();
   }
 
-  /**
-   * ✅ Select next hand that still needs action.
-   * Arms timer for that hand only.
-   */
   private setNextActiveHand() {
-    // clear existing timer whenever we are re-evaluating turns
     this.clearActionTimer();
 
-    for (let si = 0; si < this.seats.length; si++) {
-      const seat = this.seats[si];
+    const dealingSeatIndexes = this.getDealingSeatIndexes();
+
+    for (const seatIndex of dealingSeatIndexes) {
+      const seat = this.seats[seatIndex];
+
       for (let hi = 0; hi < seat.hands.length; hi++) {
         const hand = seat.hands[hi];
+
         if (
           hand.bet > 0 &&
           normalizeResult(hand.result) === "pending" &&
           !hand.isBusted &&
           !hand.isStanding
         ) {
-          this.activeSeatIndex = si;
+          this.activeSeatIndex = seatIndex;
           this.activeHandIndex = hi;
-
-          // ✅ start a fresh timer ONLY for the active seat/hand
           this.armActionTimer();
           return;
         }
       }
     }
 
-    // no more player actions
     this.activeSeatIndex = null;
     this.activeHandIndex = null;
     this.clearActionTimer();
     this.startDealerTurn();
   }
-
-  // ---- player actions ----
 
   private handleAction(msg: ClientToServerMessage) {
     const action = msg.action as
@@ -668,7 +697,6 @@ export class BlackjackRoomManager {
     const hand = seat.hands[this.activeHandIndex];
     if (!hand) return;
 
-    // ✅ consume turn timer on any valid action attempt
     this.clearActionTimer();
 
     switch (action) {
@@ -754,19 +782,14 @@ export class BlackjackRoomManager {
 
     seat.hands = [hand, newHand];
 
-    // After split, player should act on hand 0 first
     this.activeHandIndex = 0;
     this.activeSeatIndex = seat.seatIndex;
-
-    // ✅ re-arm timer for this new “same-seat” turn
     this.armActionTimer();
   }
 
-  // ---- dealer + settlement ----
-
   private startDealerTurn() {
     this.phase = "dealer-turn";
-    this.clearActionTimer(); // ✅ stop player timer
+    this.clearActionTimer();
     this.clearDealerStepTimeout();
     this.dealerHoleRevealed = false;
 
@@ -789,7 +812,7 @@ export class BlackjackRoomManager {
 
     const { total, soft } = handValue(this.dealerCards);
 
-    const shouldHit = total < 17 || (total === 17 && soft === true); // H17
+    const shouldHit = total < 17 || (total === 17 && soft === true);
     if (!shouldHit) {
       this.settleHands();
       this.phase = "round-complete";
@@ -852,7 +875,7 @@ export class BlackjackRoomManager {
         hand.isBlackjack = bj;
         hand.isBusted = bust;
 
-        // bankroll settles back locally (your real GLD settlement is handled by client)
+        // local bankroll sim
         seat.bankroll += hand.bet + payout;
       }
     }
@@ -882,8 +905,6 @@ export class BlackjackRoomManager {
 
     this.broadcastState();
   }
-
-  // ---- broadcast / views ----
 
   private buildView(): BlackjackTableState {
     const seats: BlackjackSeatState[] = this.seats.map((s) => ({

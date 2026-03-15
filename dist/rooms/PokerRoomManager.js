@@ -142,6 +142,9 @@ class PokerRoomManager {
             case "action":
                 this.handleAction(msg.playerId, msg.action, msg.amount);
                 break;
+            case "timeout-fold":
+  void this.handleTimeoutFold(playerId);
+  return;    
             // client asks server to reveal *their* hole cards to everyone
             case "show-cards":
                 this.handleShowCards(msg.playerId);

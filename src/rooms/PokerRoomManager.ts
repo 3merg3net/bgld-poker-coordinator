@@ -13,6 +13,12 @@ type ClientEntry = {
   name?: string;
 };
 
+type InactivityState = {
+  missedTurns: number;
+  isSittingOut: boolean;
+  lastActionAt: number;
+};
+
 export class PokerRoomManager {
   private roomId: string;
   private clients: Map<string, ClientEntry> = new Map();
@@ -33,19 +39,171 @@ export class PokerRoomManager {
   private revealedThisHand: Set<string> = new Set();
   private static readonly AUTO_DEAL_DELAY_MS = 10_000;
 
+  // ✅ Server-owned action timer
+  private actionTimer: NodeJS.Timeout | null = null;
+  private actionTurnKey: string | null = null;
+
+  private readonly ACTION_BASE_MS =
+    Number(process.env.POKER_ACTION_BASE_MS ?? "") || 30_000;
+
+  private readonly ACTION_EXTRA_MS =
+    Number(process.env.POKER_ACTION_EXTRA_MS ?? "") || 20_000;
+
+  private readonly AUTO_SIT_OUT_AFTER_MISSES =
+    Number(process.env.POKER_AUTO_SIT_OUT_AFTER_MISSES ?? "") || 2;
+
   private paused = false;
   private pauseUntil: number | null = null;
   private pausedBy: string | null = null;
-
   private pauseTimer: NodeJS.Timeout | null = null;
 
-  // inside PokerRoomManager class
+  // Disconnect / mobile background grace
   private disconnectTimers = new Map<string, NodeJS.Timeout>();
   private disconnectedAt = new Map<string, number>();
-
-  // how long we tolerate mobile background drops
   private readonly DISCONNECT_GRACE_MS =
     Number(process.env.POKER_DISCONNECT_GRACE_MS ?? "") || 45_000;
+
+  // Inactivity / sit-out tracking
+  private inactivity = new Map<string, InactivityState>();
+
+  // WSOP-style: HOLD NEXT DEAL (never freezes action mid-hand)
+  private dealHeld = false;
+  private dealHeldBy: string | null = null;
+  private dealHeldAt: number | null = null;
+
+  // ✅ Optional: lightweight bankroll cache to reduce Supabase reads
+  private bankrollCache: Map<string, { v: number; ts: number }> = new Map();
+  private static readonly BANKROLL_CACHE_TTL_MS = 2_000;
+
+  // ─────────────────────────────────────────────────────────────
+  // DEMO FALLBACK (in-memory) — used when Supabase bankroll calls fail
+  // ─────────────────────────────────────────────────────────────
+  private demoBankroll: Map<string, number> = new Map();
+
+  private mode: "cash" | "tournament" = "cash";
+
+  private tournamentConfig: null | {
+    tournamentId: string;
+    buyIn: number;
+    startingStack: number;
+    seatsPerTable: number;
+  } = null;
+
+  private tournamentAllowList: Set<string> | null = null;
+
+  constructor(roomId: string, opts?: { mode?: "cash" | "tournament" }) {
+    this.roomId = roomId;
+    this.mode = opts?.mode ?? "cash";
+
+    for (let i = 0; i < 9; i++) {
+      this.seats.push({
+        seatIndex: i,
+        playerId: null,
+        handle: undefined,
+        name: undefined,
+        chips: 0,
+      });
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // INACTIVITY HELPERS
+  // ─────────────────────────────────────────────────────────────
+
+  private getInactivityState(playerId: string): InactivityState {
+    const existing = this.inactivity.get(playerId);
+    if (existing) return existing;
+
+    const next: InactivityState = {
+      missedTurns: 0,
+      isSittingOut: false,
+      lastActionAt: Date.now(),
+    };
+    this.inactivity.set(playerId, next);
+    return next;
+  }
+
+  private markPlayerActive(playerId: string) {
+    if (!playerId) return;
+    const cur = this.getInactivityState(playerId);
+    cur.missedTurns = 0;
+    cur.lastActionAt = Date.now();
+    this.inactivity.set(playerId, cur);
+  }
+
+  private recordMissedTurn(playerId: string) {
+    if (!playerId) return;
+
+    const cur = this.getInactivityState(playerId);
+    cur.missedTurns += 1;
+    cur.lastActionAt = Date.now();
+
+    let newlySatOut = false;
+    if (cur.missedTurns >= this.AUTO_SIT_OUT_AFTER_MISSES && !cur.isSittingOut) {
+      cur.isSittingOut = true;
+      newlySatOut = true;
+    }
+
+    this.inactivity.set(playerId, cur);
+
+    if (newlySatOut) {
+      this.broadcast({
+        kind: "poker",
+        roomId: this.roomId,
+        playerId: "server",
+        type: "player-sitout-state",
+        targetPlayerId: playerId,
+        isSittingOut: true,
+        missedTurns: cur.missedTurns,
+        reason: "inactive",
+      } as any);
+
+      const seat = this.seats.find((s) => s.playerId === playerId);
+      const label = seat?.handle || seat?.name || "Player";
+
+      this.broadcast({
+        kind: "poker",
+        roomId: this.roomId,
+        playerId: "server",
+        type: "chat-broadcast",
+        text: `${label} is now sitting out due to inactivity.`,
+      } as any);
+    }
+  }
+
+  private setPlayerSittingOut(playerId: string, sittingOut: boolean, reason = "manual") {
+    if (!playerId) return;
+
+    const cur = this.getInactivityState(playerId);
+    cur.isSittingOut = sittingOut;
+    cur.lastActionAt = Date.now();
+
+    if (!sittingOut) {
+      cur.missedTurns = 0;
+    }
+
+    this.inactivity.set(playerId, cur);
+
+    this.broadcast({
+      kind: "poker",
+      roomId: this.roomId,
+      playerId: "server",
+      type: "player-sitout-state",
+      targetPlayerId: playerId,
+      isSittingOut: sittingOut,
+      missedTurns: cur.missedTurns,
+      reason,
+    } as any);
+  }
+
+  private isPlayerSittingOut(playerId: string | null | undefined) {
+    if (!playerId) return false;
+    return this.inactivity.get(playerId)?.isSittingOut === true;
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // DISCONNECT HELPERS
+  // ─────────────────────────────────────────────────────────────
 
   private clearDisconnectTimer(playerId: string) {
     const t = this.disconnectTimers.get(playerId);
@@ -56,155 +214,28 @@ export class PokerRoomManager {
   public markDisconnected(playerId: string) {
     if (!playerId) return;
 
-    // mark time + arm grace timer
     this.disconnectedAt.set(playerId, Date.now());
     this.clearDisconnectTimer(playerId);
 
-    // ✅ IMPORTANT: detach the dead socket
+    // detach dead socket but keep seat during grace
     this.clients.delete(playerId);
 
     const t = setTimeout(() => {
-      // if still disconnected after grace -> finalize removal (cash out / clear seat)
-      if (this.clients.has(playerId)) return; // reconnected
-      if (!this.disconnectedAt.has(playerId)) return; // already handled
+      if (this.clients.has(playerId)) return;
+      if (!this.disconnectedAt.has(playerId)) return;
       this.removeClient(playerId, "timeout");
     }, this.DISCONNECT_GRACE_MS);
 
     this.disconnectTimers.set(playerId, t as any);
 
-    // Optional: broadcast seats so others see them still seated
     try {
       void this.broadcastSeats();
     } catch {}
   }
 
-  public reconnectClient(
-    playerId: string,
-    socket: WebSocket,
-    name?: string,
-    meta?: { tableName?: string; private?: string | boolean | number }
-  ) {
-    if (!playerId || !socket) return;
-
-    // cancel pending timeout removal and mark as connected again
-    this.clearDisconnectTimer(playerId);
-    this.disconnectedAt.delete(playerId);
-
-    // ✅ restore expected client shape
-    this.clients.set(playerId, { socket, playerId, name });
-
-    // keep room meta capture consistent with addClient (optional)
-    try {
-      if (!this.tableName) {
-        const raw = typeof meta?.tableName === "string" ? meta.tableName.trim() : "";
-        if (raw) this.tableName = raw.slice(0, 24);
-      }
-      if (!this.isPrivate) {
-        const p = meta?.private;
-        const isP =
-          p === "1" ||
-          p === 1 ||
-          p === true ||
-          (typeof p === "string" && p.toLowerCase() === "true");
-        if (isP) this.isPrivate = true;
-      }
-    } catch {}
-
-    // ✅ resync the reconnecting client with current state (like addClient does)
-    try {
-      // seats + bankrolls (async, don’t block)
-      (async () => {
-        const bankrolls = await this.bankrollsSnapshot();
-        this.sendTo(playerId, {
-          kind: "poker",
-          roomId: this.roomId,
-          playerId,
-          type: "seats-update",
-          seats: this.seats,
-          bankrolls,
-        } as any);
-      })();
-
-      const lastTable = this.game.getLastState();
-      if (lastTable) {
-        const playersForBroadcast =
-          this.mode === "tournament"
-            ? lastTable.players.map((p) => ({ ...p, holeCards: [] }))
-            : lastTable.players;
-
-        this.sendTo(playerId, {
-          kind: "poker",
-          roomId: this.roomId,
-          playerId,
-          type: "table-state",
-          handId: lastTable.handId,
-          board: lastTable.board,
-          players: playersForBroadcast,
-        } as any);
-      }
-
-      const betting = this.game.getBettingState();
-      if (betting) {
-        this.sendTo(playerId, {
-          kind: "poker",
-          roomId: this.roomId,
-          playerId,
-          type: "betting-state",
-          handId: betting.handId,
-          street: betting.street,
-          pot: betting.pot,
-          buttonSeatIndex: betting.buttonSeatIndex,
-          currentSeatIndex: betting.currentSeatIndex,
-          bigBlind: betting.bigBlind,
-          smallBlind: betting.smallBlind,
-          maxCommitted: betting.maxCommitted,
-          players: betting.players,
-          smallBlindSeatIndex: (betting as any).smallBlindSeatIndex ?? null,
-          bigBlindSeatIndex: (betting as any).bigBlindSeatIndex ?? null,
-        } as any);
-      }
-
-      // ✅ if mid-hand, resend hero hole cards (PRIVATE)
-      const t = this.game.getLastState();
-      const b = this.game.getBettingState();
-      if (t && b && b.street !== "done") {
-        const cards =
-          (this.game as any).getPrivateHoleCards?.(playerId) ??
-          this.game.getHoleCardsForPlayer(playerId); // fallback (older engine)
-
-        if (cards && cards.length >= 2) {
-          this.sendTo(playerId, {
-            kind: "poker",
-            roomId: this.roomId,
-            playerId: "server",
-            type: "hole-cards",
-            handId: t.handId,
-            cards: cards.slice(0, 2),
-          } as any);
-        }
-      }
-
-      // deal-hold state
-      this.sendTo(playerId, {
-        kind: "poker",
-        roomId: this.roomId,
-        playerId: "server",
-        type: "deal-hold-state",
-        held: this.dealHeld,
-        heldBy: this.dealHeldBy,
-        heldAt: this.dealHeldAt,
-      } as any);
-
-      void this.broadcastSeats();
-    } catch {}
-  }
-
-  public hasKnownPlayer(playerId: string) {
-    if (!playerId) return false;
-    if (this.clients.has(playerId)) return true;
-    if (this.disconnectedAt.has(playerId)) return true; // ✅ important
-    return this.seats.some((s) => s.playerId === playerId);
-  }
+  // ─────────────────────────────────────────────────────────────
+  // PAUSE / DEAL HOLD
+  // ─────────────────────────────────────────────────────────────
 
   private broadcastPauseState() {
     this.broadcast({
@@ -263,43 +294,13 @@ export class PokerRoomManager {
 
     this.broadcastPauseState();
 
-    // If no hand in progress, re-arm autodeal
     if (!this.handInProgress) {
-      const eligible = this.seats.filter((s) => s.playerId && (s.chips ?? 0) > 0);
+      const eligible = this.seats.filter(
+        (s) => s.playerId && (s.chips ?? 0) > 0 && !this.isPlayerSittingOut(s.playerId)
+      );
       if (eligible.length >= 2 && this.clients.size > 0) this.armAutoDeal();
     }
   }
-
-  /**
-   * Hard emergency end: abort hand + clear UI + allow next hand.
-   * This does NOT award pot (emergency only).
-   */
-  private forceEndHand(reason: string) {
-    const anyGame: any = this.game as any;
-
-    if (typeof anyGame.abortHand === "function") {
-      anyGame.abortHand(reason);
-    } else if (typeof anyGame.resetTable === "function") {
-      anyGame.resetTable(reason);
-    }
-
-    this.handInProgress = false;
-    this.revealedThisHand.clear();
-    this.clearAutoDealTimer();
-
-    this.broadcastClearTable(reason);
-
-    // re-sync + maybe re-arm
-    this.syncGameWithSeats(`forceEndHand:${reason}`);
-
-    const eligible = this.seats.filter((s) => s.playerId && (s.chips ?? 0) > 0);
-    if (eligible.length >= 2 && this.clients.size > 0) this.armAutoDeal();
-  }
-
-  // WSOP-style: HOLD NEXT DEAL (never freezes action mid-hand)
-  private dealHeld = false;
-  private dealHeldBy: string | null = null;
-  private dealHeldAt: number | null = null;
 
   private broadcastDealHoldState() {
     this.broadcast({
@@ -344,21 +345,96 @@ export class PokerRoomManager {
 
     this.broadcastDealHoldState();
 
-    // If no hand in progress, re-arm autodeal
     if (!this.handInProgress) {
-      const eligible = this.seats.filter((s) => s.playerId && (s.chips ?? 0) > 0);
+      const eligible = this.seats.filter(
+        (s) => s.playerId && (s.chips ?? 0) > 0 && !this.isPlayerSittingOut(s.playerId)
+      );
       if (eligible.length >= 2 && this.clients.size > 0) this.armAutoDeal();
     }
   }
 
-  // ✅ Optional: lightweight bankroll cache to reduce Supabase reads
-  private bankrollCache: Map<string, { v: number; ts: number }> = new Map();
-  private static readonly BANKROLL_CACHE_TTL_MS = 2_000;
+  // ─────────────────────────────────────────────────────────────
+  // ACTION TIMER
+  // ─────────────────────────────────────────────────────────────
+
+  private clearActionTimer() {
+    if (this.actionTimer) {
+      clearTimeout(this.actionTimer);
+      this.actionTimer = null;
+    }
+    this.actionTurnKey = null;
+  }
+
+  private armActionTimer() {
+    this.clearActionTimer();
+
+    const betting = this.game.getBettingState();
+    if (!betting || betting.street === "done" || betting.currentSeatIndex == null) return;
+
+    const seat = this.seats.find((s) => s.seatIndex === betting.currentSeatIndex);
+    const playerId = seat?.playerId;
+    if (!playerId) return;
+
+    const turnKey = `${betting.handId}:${betting.street}:${betting.currentSeatIndex}`;
+    this.actionTurnKey = turnKey;
+
+    this.actionTimer = setTimeout(() => {
+      const live = this.game.getBettingState();
+      if (!live || live.street === "done" || live.currentSeatIndex == null) return;
+
+      const liveKey = `${live.handId}:${live.street}:${live.currentSeatIndex}`;
+      if (liveKey !== turnKey) return;
+
+      this.actionTimer = setTimeout(() => {
+        const again = this.game.getBettingState();
+        if (!again || again.street === "done" || again.currentSeatIndex == null) return;
+
+        const againKey = `${again.handId}:${again.street}:${again.currentSeatIndex}`;
+        if (againKey !== turnKey) return;
+
+        this.handleServerInactivityTimeout(playerId);
+      }, this.ACTION_EXTRA_MS) as any;
+    }, this.ACTION_BASE_MS) as any;
+  }
+
+  private async handleServerInactivityTimeout(playerId: string) {
+    const betting = this.game.getBettingState();
+    if (!betting || betting.street === "done") return;
+
+    const p = betting.players.find((x: any) => String(x.playerId) === String(playerId));
+    if (!p || p.hasFolded || !p.inHand) return;
+
+    // Always fold inactive players.
+// Auto-check causes endless inactive loops when multiple players keep timing out.
+const forcedAction: "fold" = "fold";
+
+    this.recordMissedTurn(playerId);
+
+    const seat = this.seats.find((s) => s.playerId === playerId);
+    const label = seat?.handle || seat?.name || "Player";
+
+    this.broadcast({
+  kind: "poker",
+  roomId: this.roomId,
+  playerId: "server",
+  type: "chat-broadcast",
+  text: `${label} auto-folded for inactivity.`,
+} as any);
+
+    this.applyResolvedAction(playerId, forcedAction, undefined, { countAsActivity: false });
+
+    const state = this.getInactivityState(playerId);
+    if (state.isSittingOut && this.mode === "cash") {
+      const latest = this.game.getBettingState();
+      if (!latest || latest.street === "done") {
+        await this.handleStand(playerId);
+      }
+    }
+  }
 
   // ─────────────────────────────────────────────────────────────
-  // DEMO FALLBACK (in-memory) — used when Supabase bankroll calls fail
+  // DEMO / BANKROLL HELPERS
   // ─────────────────────────────────────────────────────────────
-  private demoBankroll: Map<string, number> = new Map();
 
   private getDemoBankroll(playerId: string) {
     return Math.max(0, Math.floor(this.demoBankroll.get(playerId) ?? 0));
@@ -419,89 +495,6 @@ export class PokerRoomManager {
     }
   }
 
-  private mode: "cash" | "tournament" = "cash";
-
-  constructor(roomId: string, opts?: { mode?: "cash" | "tournament" }) {
-    this.roomId = roomId;
-    this.mode = opts?.mode ?? "cash";
-
-    for (let i = 0; i < 9; i++) {
-      this.seats.push({
-        seatIndex: i,
-        playerId: null,
-        handle: undefined,
-        name: undefined,
-        chips: 0,
-      });
-    }
-  }
-
-  private tournamentConfig: null | {
-    tournamentId: string;
-    buyIn: number;
-    startingStack: number;
-    seatsPerTable: number;
-  } = null;
-
-  public setTournamentConfig(cfg: {
-    tournamentId: string;
-    buyIn: number;
-    startingStack: number;
-    seatsPerTable: number;
-  }) {
-    if (this.mode !== "tournament") return;
-    if (!cfg) return;
-
-    this.tournamentConfig = {
-      tournamentId: String(cfg.tournamentId ?? ""),
-      buyIn: Math.max(0, Math.floor(Number(cfg.buyIn ?? 0))),
-      startingStack: Math.max(0, Math.floor(Number(cfg.startingStack ?? 0))),
-      seatsPerTable: Math.max(2, Math.min(9, Math.floor(Number(cfg.seatsPerTable ?? 9)))),
-    };
-  }
-
-  private tournamentAllowList: Set<string> | null = null;
-
-  public setTournamentAllowList(players: string[]) {
-    if (this.mode !== "tournament") return;
-    const arr = Array.isArray(players) ? players : [];
-    this.tournamentAllowList = new Set(arr.map((x) => String(x)));
-  }
-
-  public autoSeatTournamentPlayers(players: string[]) {
-    if (this.mode !== "tournament") return;
-
-    const stack = Math.max(1, Math.floor(Number(this.tournamentConfig?.startingStack ?? 0)));
-    if (!stack) return;
-
-    const arr = Array.isArray(players) ? players : [];
-    for (const pid of arr) {
-      if (!pid) continue;
-      if (this.seats.some((s) => s.playerId === pid)) continue;
-
-      const open = this.seats.find((s) => !s.playerId);
-      if (!open) break;
-
-      this.seats = this.seats.map((s) =>
-        s.seatIndex === open.seatIndex
-          ? { ...s, playerId: pid, name: this.clients.get(pid)?.name, chips: stack }
-          : s
-      );
-    }
-
-    this.syncGameWithSeats("autoSeatTournamentPlayers");
-    void this.broadcastSeats();
-
-    if (!this.handInProgress) {
-      const eligible = this.seats.filter((s) => s.playerId && (s.chips ?? 0) > 0);
-      if (eligible.length >= 2 && this.clients.size > 0) this.armAutoDeal();
-    }
-  }
-
-  // ─────────────────────────────────────────────────────────────
-  // BANKROLL HELPERS
-  // ─────────────────────────────────────────────────────────────
-
   private invalidateBankroll(playerId: string) {
     this.bankrollCache.delete(playerId);
   }
@@ -547,6 +540,67 @@ export class PokerRoomManager {
       seats: this.seats,
       bankrolls,
     } as any);
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // TOURNAMENT HELPERS
+  // ─────────────────────────────────────────────────────────────
+
+  public setTournamentConfig(cfg: {
+    tournamentId: string;
+    buyIn: number;
+    startingStack: number;
+    seatsPerTable: number;
+  }) {
+    if (this.mode !== "tournament") return;
+    if (!cfg) return;
+
+    this.tournamentConfig = {
+      tournamentId: String(cfg.tournamentId ?? ""),
+      buyIn: Math.max(0, Math.floor(Number(cfg.buyIn ?? 0))),
+      startingStack: Math.max(0, Math.floor(Number(cfg.startingStack ?? 0))),
+      seatsPerTable: Math.max(2, Math.min(9, Math.floor(Number(cfg.seatsPerTable ?? 9)))),
+    };
+  }
+
+  public setTournamentAllowList(players: string[]) {
+    if (this.mode !== "tournament") return;
+    const arr = Array.isArray(players) ? players : [];
+    this.tournamentAllowList = new Set(arr.map((x) => String(x)));
+  }
+
+  public autoSeatTournamentPlayers(players: string[]) {
+    if (this.mode !== "tournament") return;
+
+    const stack = Math.max(1, Math.floor(Number(this.tournamentConfig?.startingStack ?? 0)));
+    if (!stack) return;
+
+    const arr = Array.isArray(players) ? players : [];
+    for (const pid of arr) {
+      if (!pid) continue;
+      if (this.seats.some((s) => s.playerId === pid)) continue;
+
+      const open = this.seats.find((s) => !s.playerId);
+      if (!open) break;
+
+      this.seats = this.seats.map((s) =>
+        s.seatIndex === open.seatIndex
+          ? { ...s, playerId: pid, name: this.clients.get(pid)?.name, chips: stack }
+          : s
+      );
+
+      this.setPlayerSittingOut(pid, false, "auto-seat");
+    }
+
+    this.syncGameWithSeats("autoSeatTournamentPlayers");
+    void this.broadcastSeats();
+
+    if (!this.handInProgress) {
+      const eligible = this.seats.filter(
+        (s) => s.playerId && (s.chips ?? 0) > 0 && !this.isPlayerSittingOut(s.playerId)
+      );
+      if (eligible.length >= 2 && this.clients.size > 0) this.armAutoDeal();
+    }
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -658,6 +712,13 @@ export class PokerRoomManager {
     return { onlineCount, seatedCount };
   }
 
+  public hasKnownPlayer(playerId: string) {
+    if (!playerId) return false;
+    if (this.clients.has(playerId)) return true;
+    if (this.disconnectedAt.has(playerId)) return true;
+    return this.seats.some((s) => s.playerId === playerId);
+  }
+
   // ─────────────────────────────────────────────────────────────
   // CLIENT JOIN/LEAVE
   // ─────────────────────────────────────────────────────────────
@@ -670,7 +731,6 @@ export class PokerRoomManager {
   ) {
     this.clients.set(playerId, { socket, playerId, name });
 
-    // ✅ tournament allowlist: warn non-assigned spectators
     if (this.mode === "tournament" && this.tournamentAllowList) {
       if (!this.tournamentAllowList.has(playerId)) {
         this.sendTo(playerId, {
@@ -683,7 +743,6 @@ export class PokerRoomManager {
       }
     }
 
-    // ✅ Tournament auto-seat safety net
     if (this.mode === "tournament" && this.tournamentAllowList?.has(playerId)) {
       const alreadySeated = this.seats.some((s) => s.playerId === playerId);
       const stack = Math.max(0, Math.floor(Number(this.tournamentConfig?.startingStack ?? 0)));
@@ -697,18 +756,21 @@ export class PokerRoomManager {
               : s
           );
 
+          this.setPlayerSittingOut(playerId, false, "tournament-auto-seat");
+
           this.syncGameWithSeats("tournament-auto-seat:addClient");
           void this.broadcastSeats();
 
           if (!this.handInProgress) {
-            const eligible = this.seats.filter((s) => s.playerId && (s.chips ?? 0) > 0);
+            const eligible = this.seats.filter(
+              (s) => s.playerId && (s.chips ?? 0) > 0 && !this.isPlayerSittingOut(s.playerId)
+            );
             if (eligible.length >= 2 && this.clients.size > 0) this.armAutoDeal();
           }
         }
       }
     }
 
-    // ✅ if mid-hand, send hero hole cards privately on join
     const t = this.game.getLastState();
     const b = this.game.getBettingState();
     if (t && b && b.street !== "done") {
@@ -727,7 +789,6 @@ export class PokerRoomManager {
       }
     }
 
-    // Capture room meta once (first writer wins)
     try {
       if (!this.tableName) {
         const raw = typeof meta?.tableName === "string" ? meta.tableName.trim() : "";
@@ -755,7 +816,6 @@ export class PokerRoomManager {
       onlineCount: this.clients.size,
     } as any);
 
-    // send seats + bankrolls to joining client
     (async () => {
       const bankrolls = await this.bankrollsSnapshot();
       this.sendTo(playerId, {
@@ -807,7 +867,6 @@ export class PokerRoomManager {
       } as any);
     }
 
-    // ✅ tell joining client current deal-hold state
     this.sendTo(playerId, {
       kind: "poker",
       roomId: this.roomId,
@@ -817,6 +876,143 @@ export class PokerRoomManager {
       heldBy: this.dealHeldBy,
       heldAt: this.dealHeldAt,
     } as any);
+
+    const sitState = this.getInactivityState(playerId);
+    this.sendTo(playerId, {
+      kind: "poker",
+      roomId: this.roomId,
+      playerId: "server",
+      type: "player-sitout-state",
+      targetPlayerId: playerId,
+      isSittingOut: sitState.isSittingOut,
+      missedTurns: sitState.missedTurns,
+      reason: "join-sync",
+    } as any);
+  }
+
+  public reconnectClient(
+    playerId: string,
+    socket: WebSocket,
+    name?: string,
+    meta?: { tableName?: string; private?: string | boolean | number }
+  ) {
+    if (!playerId || !socket) return;
+
+    this.clearDisconnectTimer(playerId);
+    this.disconnectedAt.delete(playerId);
+    this.clients.set(playerId, { socket, playerId, name });
+
+    try {
+      if (!this.tableName) {
+        const raw = typeof meta?.tableName === "string" ? meta.tableName.trim() : "";
+        if (raw) this.tableName = raw.slice(0, 24);
+      }
+      if (!this.isPrivate) {
+        const p = meta?.private;
+        const isP =
+          p === "1" ||
+          p === 1 ||
+          p === true ||
+          (typeof p === "string" && p.toLowerCase() === "true");
+        if (isP) this.isPrivate = true;
+      }
+    } catch {}
+
+    try {
+      (async () => {
+        const bankrolls = await this.bankrollsSnapshot();
+        this.sendTo(playerId, {
+          kind: "poker",
+          roomId: this.roomId,
+          playerId,
+          type: "seats-update",
+          seats: this.seats,
+          bankrolls,
+        } as any);
+      })();
+
+      const lastTable = this.game.getLastState();
+      if (lastTable) {
+        const playersForBroadcast =
+          this.mode === "tournament"
+            ? lastTable.players.map((p) => ({ ...p, holeCards: [] }))
+            : lastTable.players;
+
+        this.sendTo(playerId, {
+          kind: "poker",
+          roomId: this.roomId,
+          playerId,
+          type: "table-state",
+          handId: lastTable.handId,
+          board: lastTable.board,
+          players: playersForBroadcast,
+        } as any);
+      }
+
+      const betting = this.game.getBettingState();
+      if (betting) {
+        this.sendTo(playerId, {
+          kind: "poker",
+          roomId: this.roomId,
+          playerId,
+          type: "betting-state",
+          handId: betting.handId,
+          street: betting.street,
+          pot: betting.pot,
+          buttonSeatIndex: betting.buttonSeatIndex,
+          currentSeatIndex: betting.currentSeatIndex,
+          bigBlind: betting.bigBlind,
+          smallBlind: betting.smallBlind,
+          maxCommitted: betting.maxCommitted,
+          players: betting.players,
+          smallBlindSeatIndex: (betting as any).smallBlindSeatIndex ?? null,
+          bigBlindSeatIndex: (betting as any).bigBlindSeatIndex ?? null,
+        } as any);
+      }
+
+      const t = this.game.getLastState();
+      const b = this.game.getBettingState();
+      if (t && b && b.street !== "done") {
+        const cards =
+          (this.game as any).getPrivateHoleCards?.(playerId) ??
+          this.game.getHoleCardsForPlayer(playerId);
+
+        if (cards && cards.length >= 2) {
+          this.sendTo(playerId, {
+            kind: "poker",
+            roomId: this.roomId,
+            playerId: "server",
+            type: "hole-cards",
+            handId: t.handId,
+            cards: cards.slice(0, 2),
+          } as any);
+        }
+      }
+
+      this.sendTo(playerId, {
+        kind: "poker",
+        roomId: this.roomId,
+        playerId: "server",
+        type: "deal-hold-state",
+        held: this.dealHeld,
+        heldBy: this.dealHeldBy,
+        heldAt: this.dealHeldAt,
+      } as any);
+
+      const sitState = this.getInactivityState(playerId);
+      this.sendTo(playerId, {
+        kind: "poker",
+        roomId: this.roomId,
+        playerId: "server",
+        type: "player-sitout-state",
+        targetPlayerId: playerId,
+        isSittingOut: sitState.isSittingOut,
+        missedTurns: sitState.missedTurns,
+        reason: "reconnect-sync",
+      } as any);
+
+      void this.broadcastSeats();
+    } catch {}
   }
 
   removeClient(
@@ -832,13 +1028,13 @@ export class PokerRoomManager {
     }
 
     this.clients.delete(playerId);
+    this.inactivity.delete(playerId);
 
     let changed = false;
 
     const stackToReturn = (() => {
       const seat = this.seats.find((s) => s.playerId === playerId);
-      const stack = Math.max(0, Math.floor(Number(seat?.chips ?? 0)));
-      return stack;
+      return Math.max(0, Math.floor(Number(seat?.chips ?? 0)));
     })();
 
     this.seats = this.seats.map((s) => {
@@ -851,7 +1047,6 @@ export class PokerRoomManager {
 
     this.syncGameWithSeats(reason);
 
-    // Return stack asynchronously (cash mode only)
     if (this.mode === "cash" && stackToReturn > 0) {
       (async () => {
         try {
@@ -898,6 +1093,7 @@ export class PokerRoomManager {
       t === "host-resume-deal" ||
       t === "host-reset" ||
       t === "host-force-end-hand" ||
+      t === "reset-table" ||
       t === "ping" ||
       t === "chat" ||
       t === "sit" ||
@@ -914,7 +1110,7 @@ export class PokerRoomManager {
       return;
     }
 
-    switch ((msg as any).type) {
+    switch (t) {
       case "ping":
         this.sendTo(playerId, {
           kind: "poker",
@@ -981,6 +1177,7 @@ export class PokerRoomManager {
         return;
       }
 
+      case "reset-table":
       case "host-reset": {
         if (!this.isHost(playerId)) return;
 
@@ -1040,6 +1237,10 @@ export class PokerRoomManager {
     }
   }
 
+  // ─────────────────────────────────────────────────────────────
+  // RESET / FORCE END
+  // ─────────────────────────────────────────────────────────────
+
   private handleResetTable(requesterId: string) {
     if (!this.isHost(requesterId)) {
       this.sendTo(requesterId, {
@@ -1062,14 +1263,40 @@ export class PokerRoomManager {
     this.handInProgress = false;
     this.revealedThisHand.clear();
     this.clearAutoDealTimer();
+    this.clearActionTimer();
 
     this.broadcastClearTable("HOST_RESET");
 
     this.cleanupGhostSeats();
-    const eligible = this.seats.filter((s) => s.playerId && (s.chips ?? 0) > 0);
+    const eligible = this.seats.filter(
+      (s) => s.playerId && (s.chips ?? 0) > 0 && !this.isPlayerSittingOut(s.playerId)
+    );
     if (eligible.length >= 2 && this.clients.size > 0) {
       this.armAutoDeal();
     }
+  }
+
+  private forceEndHand(reason: string) {
+    const anyGame: any = this.game as any;
+
+    if (typeof anyGame.abortHand === "function") {
+      anyGame.abortHand(reason);
+    } else if (typeof anyGame.resetTable === "function") {
+      anyGame.resetTable(reason);
+    }
+
+    this.handInProgress = false;
+    this.revealedThisHand.clear();
+    this.clearAutoDealTimer();
+    this.clearActionTimer();
+
+    this.broadcastClearTable(reason);
+    this.syncGameWithSeats(`forceEndHand:${reason}`);
+
+    const eligible = this.seats.filter(
+      (s) => s.playerId && (s.chips ?? 0) > 0 && !this.isPlayerSittingOut(s.playerId)
+    );
+    if (eligible.length >= 2 && this.clients.size > 0) this.armAutoDeal();
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -1099,7 +1326,6 @@ export class PokerRoomManager {
     const safeHandle = h ? (h.startsWith("@") ? h : `@${h}`) : undefined;
     const safeName = String(name ?? "").trim() || undefined;
 
-    // ✅ tournament allowlist enforcement
     if (this.mode === "tournament" && this.tournamentAllowList) {
       if (!this.tournamentAllowList.has(playerId)) {
         this.sendTo(playerId, {
@@ -1113,7 +1339,6 @@ export class PokerRoomManager {
       }
     }
 
-    // pick seat
     let targetSeat: SeatView | undefined;
     if (typeof seatIndex === "number") {
       targetSeat = this.seats.find((s) => s.seatIndex === seatIndex && !s.playerId);
@@ -1132,7 +1357,6 @@ export class PokerRoomManager {
       return;
     }
 
-    // ✅ TOURNAMENT MODE: NO BANKROLL DEBIT, fixed stack
     if (this.mode === "tournament") {
       const stack = Math.max(1, Math.floor(Number(this.tournamentConfig?.startingStack ?? 0)));
       if (!stack) {
@@ -1158,23 +1382,21 @@ export class PokerRoomManager {
           : s
       );
 
-      console.log(`[PokerRoom:${this.roomId}] seated OK`, {
-        playerId,
-        seat: targetSeat?.seatIndex,
-      });
+      this.setPlayerSittingOut(playerId, false, "sit");
 
       this.syncGameWithSeats("tournament-sit");
       await this.broadcastSeats();
 
       if (!this.handInProgress) {
-        const eligible = this.seats.filter((s) => s.playerId && (s.chips ?? 0) > 0);
+        const eligible = this.seats.filter(
+          (s) => s.playerId && (s.chips ?? 0) > 0 && !this.isPlayerSittingOut(s.playerId)
+        );
         if (eligible.length >= 2 && this.clients.size > 0) this.armAutoDeal();
       }
 
       return;
     }
 
-    // ✅ CASH MODE: bankroll debit then seat
     const desired = Math.max(100, Math.floor(Number(buyIn ?? 0)));
     if (!Number.isFinite(desired) || desired <= 0) return;
 
@@ -1210,16 +1432,15 @@ export class PokerRoomManager {
         : s
     );
 
-    console.log(`[PokerRoom:${this.roomId}] seated OK`, {
-      playerId,
-      seat: targetSeat?.seatIndex,
-    });
+    this.setPlayerSittingOut(playerId, false, "sit");
 
     this.syncGameWithSeats("cash-sit");
     await this.broadcastSeats();
 
     if (!this.handInProgress) {
-      const eligible = this.seats.filter((s) => s.playerId && (s.chips ?? 0) > 0);
+      const eligible = this.seats.filter(
+        (s) => s.playerId && (s.chips ?? 0) > 0 && !this.isPlayerSittingOut(s.playerId)
+      );
       if (eligible.length >= 2 && this.clients.size > 0) this.armAutoDeal();
     }
   }
@@ -1235,27 +1456,29 @@ export class PokerRoomManager {
     const stack = Math.max(0, Math.floor(Number(seat.chips ?? 0)));
 
     this.seats = this.seats.map((s) =>
-      s.playerId === playerId ? { ...s, playerId: null, name: undefined, handle: undefined, chips: 0 } : s
+      s.playerId === playerId
+        ? { ...s, playerId: null, name: undefined, handle: undefined, chips: 0 }
+        : s
     );
+
+    this.inactivity.delete(playerId);
 
     this.syncGameWithSeats("stand");
 
-    if (this.mode === "cash") {
-      if (stack > 0) {
-        try {
-          await this.safeCredit(playerId, stack, "poker_cashout", this.roomId, {
-            seatIndex: seat.seatIndex,
-          });
-          this.invalidateBankroll(playerId);
-        } catch {
-          this.sendTo(playerId, {
-            kind: "poker",
-            roomId: this.roomId,
-            playerId,
-            type: "error",
-            message: "Cashout failed.",
-          } as any);
-        }
+    if (this.mode === "cash" && stack > 0) {
+      try {
+        await this.safeCredit(playerId, stack, "poker_cashout", this.roomId, {
+          seatIndex: seat.seatIndex,
+        });
+        this.invalidateBankroll(playerId);
+      } catch {
+        this.sendTo(playerId, {
+          kind: "poker",
+          roomId: this.roomId,
+          playerId,
+          type: "error",
+          message: "Cashout failed.",
+        } as any);
       }
     }
 
@@ -1301,7 +1524,9 @@ export class PokerRoomManager {
     await this.broadcastSeats();
 
     if (!this.handInProgress) {
-      const eligible = this.seats.filter((s) => s.playerId && (s.chips ?? 0) > 0);
+      const eligible = this.seats.filter(
+        (s) => s.playerId && (s.chips ?? 0) > 0 && !this.isPlayerSittingOut(s.playerId)
+      );
       if (eligible.length >= 2 && this.clients.size > 0) {
         this.armAutoDeal();
       }
@@ -1414,7 +1639,6 @@ export class PokerRoomManager {
       return false;
     }
 
-    // WSOP-style: if dealing is held, do NOT start the next hand
     if (this.dealHeld) {
       if (!auto && requesterId) {
         this.sendTo(requesterId, {
@@ -1441,7 +1665,10 @@ export class PokerRoomManager {
 
     this.cleanupGhostSeats();
 
-    const seatedPlayers = this.seats.filter((s) => s.playerId && (s.chips ?? 0) > 0);
+    const seatedPlayers = this.seats.filter(
+      (s) => s.playerId && (s.chips ?? 0) > 0 && !this.isPlayerSittingOut(s.playerId)
+    );
+
     if (seatedPlayers.length < 2) {
       if (!auto && requesterId) {
         this.sendTo(requesterId, {
@@ -1457,7 +1684,21 @@ export class PokerRoomManager {
 
     this.clearAutoDealTimer();
 
-    const table = this.game.startHand(this.seats);
+    const playableSeats: SeatView[] = this.seats.map((s) => {
+      if (!s.playerId) return s;
+      if (this.isPlayerSittingOut(s.playerId)) {
+        return {
+          ...s,
+          playerId: null,
+          handle: undefined,
+          name: undefined,
+          chips: 0,
+        };
+      }
+      return s;
+    });
+
+    const table = this.game.startHand(playableSeats);
     if (!table) {
       if (!auto && requesterId) {
         this.sendTo(requesterId, {
@@ -1474,7 +1715,6 @@ export class PokerRoomManager {
     this.handInProgress = true;
     this.revealedThisHand.clear();
 
-    // ✅ IMPORTANT: tournament mode must NOT broadcast hole cards to everyone
     const playersForBroadcast =
       this.mode === "tournament"
         ? table.players.map((p) => ({ ...p, holeCards: [] }))
@@ -1511,17 +1751,14 @@ export class PokerRoomManager {
       } as any);
     }
 
-    // ✅ Send PRIVATE hole cards to each seated player
-    for (const s of this.seats) {
-      if (!s.playerId) continue;
-
+    for (const p of table.players) {
       const cards =
-        (this.game as any).getPrivateHoleCards?.(s.playerId) ??
-        this.game.getHoleCardsForPlayer(s.playerId); // fallback
+        (this.game as any).getPrivateHoleCards?.(p.playerId) ??
+        this.game.getHoleCardsForPlayer(p.playerId);
 
       if (!cards || cards.length < 2) continue;
 
-      this.sendTo(s.playerId, {
+      this.sendTo(p.playerId, {
         kind: "poker",
         roomId: this.roomId,
         playerId: "server",
@@ -1531,16 +1768,34 @@ export class PokerRoomManager {
       } as any);
     }
 
+    this.armActionTimer();
     return true;
   }
+
+  // ─────────────────────────────────────────────────────────────
+  // ACTIONS
+  // ─────────────────────────────────────────────────────────────
 
   private handleAction(
     playerId: string,
     action: "fold" | "check" | "call" | "bet",
     amount?: number
   ) {
+    this.applyResolvedAction(playerId, action, amount, { countAsActivity: true });
+  }
+
+  private applyResolvedAction(
+    playerId: string,
+    action: "fold" | "check" | "call" | "bet",
+    amount?: number,
+    opts?: { countAsActivity?: boolean }
+  ) {
     if (this.mode === "tournament" && this.tournamentAllowList) {
       if (!this.tournamentAllowList.has(playerId)) return;
+    }
+
+    if (opts?.countAsActivity !== false) {
+      this.markPlayerActive(playerId);
     }
 
     const betting = this.game.applyAction(playerId, action, amount);
@@ -1626,7 +1881,6 @@ export class PokerRoomManager {
         })();
       }
 
-      // Sync seat chip stacks from final betting state
       const stacksBySeat: Record<number, number> = {};
       for (const p of betting.players as any[]) {
         const seatIdx = p.seatIndex;
@@ -1644,9 +1898,24 @@ export class PokerRoomManager {
       void this.broadcastSeats();
 
       this.handInProgress = false;
+      this.clearActionTimer();
+
+      // stand up any cash players who were marked sitting out from inactivity
+      if (this.mode === "cash") {
+        const toStand = this.seats
+          .filter((s) => s.playerId && this.isPlayerSittingOut(s.playerId))
+          .map((s) => String(s.playerId));
+
+        for (const pid of toStand) {
+          void this.handleStand(pid);
+        }
+      }
 
       this.cleanupGhostSeats();
-      const eligible = this.seats.filter((s) => s.playerId && (s.chips ?? 0) > 0);
+
+      const eligible = this.seats.filter(
+        (s) => s.playerId && (s.chips ?? 0) > 0 && !this.isPlayerSittingOut(s.playerId)
+      );
 
       if (eligible.length >= 2 && this.clients.size > 0) {
         console.log(
@@ -1666,14 +1935,17 @@ export class PokerRoomManager {
           text: "Auto-deal paused: need 2+ seated players with chips. Refill your stack to keep playing.",
         } as any);
       }
+
+      return;
     }
+
+    this.armActionTimer();
   }
 
   private handleShowCards(playerId: string) {
     const betting = this.game.getBettingState();
     if (!betting || betting.street !== "done") return;
 
-    // ✅ Prefer engine helper (lets you reveal even on fold-win hands)
     const anyGame: any = this.game as any;
 
     const payload =
@@ -1685,9 +1957,9 @@ export class PokerRoomManager {
       payload?.holeCards ??
       (typeof anyGame.getPrivateHoleCards === "function"
         ? (anyGame.getPrivateHoleCards(playerId) as string[] | null)
-        : (typeof anyGame.getHoleCardsForPlayer === "function"
-            ? (anyGame.getHoleCardsForPlayer(playerId) as string[] | null)
-            : null));
+        : typeof anyGame.getHoleCardsForPlayer === "function"
+        ? (anyGame.getHoleCardsForPlayer(playerId) as string[] | null)
+        : null);
 
     if (!hole || hole.length !== 2) return;
 
@@ -1728,6 +2000,7 @@ export class PokerRoomManager {
       }
 
       changed = true;
+      this.inactivity.delete(pid);
       return { ...s, playerId: null, handle: undefined, name: undefined, chips: 0 };
     });
 
@@ -1739,6 +2012,7 @@ export class PokerRoomManager {
 
   private resetTableState() {
     this.clearAutoDealTimer();
+    this.clearActionTimer();
     this.revealedThisHand.clear();
 
     const freshSeats: SeatView[] = [];
@@ -1760,12 +2034,14 @@ export class PokerRoomManager {
     for (const t of this.disconnectTimers.values()) clearTimeout(t);
     this.disconnectTimers.clear();
     this.disconnectedAt.clear();
+    this.inactivity.clear();
 
     console.log(`[PokerRoom:${this.roomId}] All clients gone. Resetting table state.`);
   }
 
   public shutdown(reason = "Room shutdown") {
     this.clearAutoDealTimer();
+    this.clearActionTimer();
     this.revealedThisHand.clear();
 
     try {
@@ -1804,7 +2080,6 @@ export class PokerRoomManager {
   // LOW-LEVEL SEND HELPERS
   // ─────────────────────────────────────────────────────────────
 
-  // ✅ Public broadcast helper for coordinator-level events
   public broadcastToRoom(payload: any) {
     this.broadcast(payload as any);
   }
